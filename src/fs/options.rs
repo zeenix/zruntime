@@ -1,23 +1,24 @@
-//! [`OpenOptions`], the builder of how a file is opened.
+//! [`OpenOptions`], a builder for opening files.
 
 use std::{future::Future, io, path::Path};
 
 use super::{File, sealed::Sealed};
 use crate::unblock;
 
-/// A builder of how a file is opened: for reading, writing or both, and what is to be done about a
-/// file that is there or is not.
+/// A builder for opening a file: for reading, writing or both, and for what to do if the file does
+/// or does not exist.
 ///
-/// The options are set on the builder, and then [`open`](OpenOptions::open) opens a file with them,
-/// any number of times. They are those of [`std::fs::OpenOptions`], which this wraps, with the same
-/// defaults and the same combinations that make an open fail. On unix, the `OpenOptionsExt` trait
-/// of the `unix` module adds the permission bits of a new file and the flags the file is opened
-/// with, and on Windows, the one of the `windows` module adds the access, the sharing and the
-/// attributes.
+/// Set the options on the builder, then call [`open`](OpenOptions::open) to open a file with them.
+/// A builder can open any number of files. It wraps [`std::fs::OpenOptions`], with the same
+/// defaults and the same combinations that make an open fail.
+///
+/// On unix, the `OpenOptionsExt` trait of the `unix` module adds the permission bits of a new file
+/// and custom open flags. On Windows, the trait of that name in the `windows` module adds options
+/// such as the access mode, the share mode and the attributes.
 ///
 /// # Example
 ///
-/// A file opened to append to has every write go to its end, whatever its position is:
+/// A file opened for appending gets every write at its end, whatever its position is:
 ///
 /// ```
 /// use futures::{AsyncWriteExt, executor::block_on};
@@ -45,9 +46,10 @@ use crate::unblock;
 pub struct OpenOptions(std::fs::OpenOptions);
 
 impl OpenOptions {
-    /// A builder with every option off, which opens nothing until at least one of
-    /// [`read`](OpenOptions::read), [`write`](OpenOptions::write) and
-    /// [`append`](OpenOptions::append) is on.
+    /// Creates a builder with every option off.
+    ///
+    /// [`open`](OpenOptions::open) fails until at least one of [`read`](OpenOptions::read),
+    /// [`write`](OpenOptions::write) and [`append`](OpenOptions::append) is on.
     pub fn new() -> Self {
         Self(std::fs::OpenOptions::new())
     }
@@ -60,46 +62,45 @@ impl OpenOptions {
 
     /// Sets whether the file is opened for writing.
     ///
-    /// A write to a file that is there overwrites what it holds, from the start of the file, and
-    /// does not shorten it: [`truncate`](OpenOptions::truncate) empties it on opening.
+    /// Writing to an existing file overwrites its contents from the start of the file and does not
+    /// shorten it. To empty it on opening, use [`truncate`](OpenOptions::truncate).
     pub fn write(&mut self, write: bool) -> &mut Self {
         self.0.write(write);
         self
     }
 
-    /// Sets whether the file is opened for appending, which is for writing as well, with every
-    /// write going to the end of the file, wherever its position is.
+    /// Sets whether the file is opened for appending, which also opens it for writing.
+    ///
+    /// Every write goes to the end of the file, wherever its position is.
     pub fn append(&mut self, append: bool) -> &mut Self {
         self.0.append(append);
         self
     }
 
-    /// Sets whether a file that is there is emptied when it is opened.
+    /// Sets whether an existing file is emptied when it is opened.
     ///
-    /// This needs the file to be opened for [writing](OpenOptions::write), and fails to open it
-    /// otherwise.
+    /// Opening fails unless the file is also opened for [writing](OpenOptions::write).
     pub fn truncate(&mut self, truncate: bool) -> &mut Self {
         self.0.truncate(truncate);
         self
     }
 
-    /// Sets whether the file is created when it is not there.
+    /// Sets whether the file is created if it does not exist.
     ///
-    /// This needs the file to be opened for [writing](OpenOptions::write) or
-    /// [appending](OpenOptions::append), and fails to open it otherwise. A file that is there is
-    /// opened as it is.
+    /// Opening fails unless the file is also opened for [writing](OpenOptions::write) or
+    /// [appending](OpenOptions::append). An existing file is opened as it is.
     pub fn create(&mut self, create: bool) -> &mut Self {
         self.0.create(create);
         self
     }
 
-    /// Sets whether the file has to be created by this open, which fails with
-    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) if a file is there.
+    /// Sets whether opening must create the file, and fail with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) if the file exists.
     ///
-    /// The check and the creation are one step, so of several that try to create the same file at
-    /// once, exactly one succeeds. [`create`](OpenOptions::create) and
-    /// [`truncate`](OpenOptions::truncate) have no effect when this is on, and a symbolic link that
-    /// is there is not followed, which fails the open as well. Like them, it needs the file to be
+    /// The check and the creation are one step. If several callers try to create the same file at
+    /// once, exactly one succeeds. A symbolic link at the path to open is not followed, and its
+    /// presence also fails the open. While this is on, [`create`](OpenOptions::create) and
+    /// [`truncate`](OpenOptions::truncate) have no effect. Like them, it needs the file to be
     /// opened for [writing](OpenOptions::write) or [appending](OpenOptions::append).
     pub fn create_new(&mut self, create_new: bool) -> &mut Self {
         self.0.create_new(create_new);
@@ -108,10 +109,14 @@ impl OpenOptions {
 
     /// Opens the file at `path` with the options of the builder.
     ///
-    /// This is [`std::fs::OpenOptions::open`], run as blocking work. It fails for the reasons that
-    /// the options give, such as a file that is not there with `create` off, and for the ones the
-    /// OS gives, such as a lack of permission. The future does not borrow the builder, which can be
-    /// changed or dropped as soon as this returns, and does nothing until it is polled.
+    /// Runs [`std::fs::OpenOptions::open`] as blocking work. The returned future does not borrow
+    /// the builder, so the builder can be changed or dropped right away. The future does nothing
+    /// until it is polled.
+    ///
+    /// # Errors
+    ///
+    /// Fails for the reasons the options give, for example a missing file with `create` off, and
+    /// for the reasons the OS gives, for example a lack of permission.
     pub fn open<P>(&self, path: P) -> impl Future<Output = io::Result<File>> + use<P>
     where
         P: AsRef<Path>,

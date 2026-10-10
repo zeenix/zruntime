@@ -1,10 +1,10 @@
 //! Unix-specific extensions to [`fs`](super).
 //!
 //! The extension traits add to the builders and the entries of the parent module what the traits of
-//! the same names in [`std::os::unix::fs`] add to those of std, and are used alike: import the
-//! trait, and call its methods on the builder or the entry. The traits of std that extend
-//! [`Metadata`](super::Metadata), [`Permissions`](super::Permissions) and
-//! [`FileType`](super::FileType), which are those of std here as well, are re-exported.
+//! the same names in [`std::os::unix::fs`] add to those of std. Import the trait, then call its
+//! methods on the builder or the entry. [`Metadata`](super::Metadata),
+//! [`Permissions`](super::Permissions) and [`FileType`](super::FileType) are the types of std, so
+//! the traits of std that extend them are re-exported here.
 
 use std::{io, path::Path};
 
@@ -16,9 +16,9 @@ pub use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 /// Makes `dst` a symbolic link to `src`.
 ///
-/// This is [`std::os::unix::fs::symlink`], run as blocking work. The link holds the path `src` as
-/// it was given, which is read relative to the directory of the link and not to the directory of
-/// the process, and `src` need not exist.
+/// Runs [`std::os::unix::fs::symlink`] as blocking work. The link stores the path `src` as given. A
+/// relative `src` is read relative to the directory of the link, not the working directory of the
+/// process. `src` need not exist.
 ///
 /// # Example
 ///
@@ -56,34 +56,36 @@ where
 
 /// Unix-specific extensions to [`DirBuilder`](super::DirBuilder).
 ///
-/// It is implemented by that type alone, and sealed.
+/// Only that type implements it. The trait is sealed.
 pub trait DirBuilderExt: Sealed {
-    /// Sets the permission bits that the directories made are created with.
+    /// Sets the permission bits that the directories created are given.
     ///
-    /// The OS clears the bits that the umask of the process has set, so the bits of a directory are
-    /// usually fewer than these. They are `0o777` unless this sets them, and apply to the parents
-    /// made by a [recursive](super::DirBuilder::recursive) builder as well.
+    /// The OS clears the bits that the umask of the process has set, so a directory usually ends up
+    /// with fewer bits than these. The default is `0o777`. The bits apply to the parents created by
+    /// a [recursive](super::DirBuilder::recursive) builder as well.
     fn mode(&mut self, mode: u32) -> &mut Self;
 }
 
 /// Unix-specific extensions to [`DirEntry`](super::DirEntry).
 ///
-/// It is implemented by that type alone, and sealed.
+/// Only that type implements it. The trait is sealed.
 pub trait DirEntryExt: Sealed {
-    /// The inode number of the entry, as the directory holds it: the `d_ino` of the entry that the
-    /// OS handed over, which is known without asking the disk for more.
+    /// The inode number of the entry, as the directory stores it.
+    ///
+    /// This is the `d_ino` field of the entry that the OS returned. It is already known, so reading
+    /// it needs no further disk access.
     fn ino(&self) -> u64;
 }
 
 /// Unix-specific extensions to [`OpenOptions`](super::OpenOptions).
 ///
-/// It is implemented by that type alone, and sealed.
+/// Only that type implements it. The trait is sealed.
 pub trait OpenOptionsExt: Sealed {
-    /// Sets the permission bits that a file is created with, if the open creates it.
+    /// Sets the permission bits that a file is given if the open creates it.
     ///
-    /// The OS clears the bits that the umask of the process has set, so the bits of a file are
-    /// usually fewer than these. They are `0o666` unless this sets them, and have no effect on a
-    /// file that is there already.
+    /// The OS clears the bits that the umask of the process has set, so a file usually ends up with
+    /// fewer bits than these. The default is `0o666`. The bits have no effect on a file that
+    /// already exists.
     ///
     /// # Example
     ///
@@ -108,12 +110,12 @@ pub trait OpenOptionsExt: Sealed {
     /// ```
     fn mode(&mut self, mode: u32) -> &mut Self;
 
-    /// Passes `flags` to the call that opens the file, along with the ones that the other options
-    /// work out.
+    /// Passes `flags` to the call that opens the file, along with the flags that the other options
+    /// produce.
     ///
-    /// The bits of the access mode are cleared from `flags`, so that they cannot disagree with
+    /// The access-mode bits are cleared from `flags`, so they cannot conflict with
     /// [`read`](super::OpenOptions::read), [`write`](super::OpenOptions::write) and
-    /// [`append`](super::OpenOptions::append). The flags can set bits and not clear any that the
-    /// options set, and replace the ones this set before.
+    /// [`append`](super::OpenOptions::append). The flags can set bits but cannot clear bits that
+    /// the options set. Each call replaces the flags of an earlier call.
     fn custom_flags(&mut self, flags: i32) -> &mut Self;
 }

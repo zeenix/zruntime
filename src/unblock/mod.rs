@@ -1,8 +1,10 @@
-//! Blocking work run on a pool of threads, out of the way of the async tasks, and [`Unblock`], an
-//! adapter that runs each operation on a blocking I/O handle as such work.
+//! Blocking work on a pool of threads, and [`Unblock`], an adapter for blocking I/O handles.
 //!
-//! The work needs no runtime: [`unblock()`] hands back a plain future, which works under any
-//! executor, and so does the adapter.
+//! [`unblock()`] runs a closure on a pool of threads and returns a future of its result.
+//! [`Unblock`] gives a blocking I/O handle (a file, the standard input, an iterator) async read,
+//! write, seek and stream traits by running each operation on it as blocking work.
+//!
+//! Neither needs a runtime. Both work under any executor.
 
 mod io;
 pub(crate) mod pool;
@@ -23,55 +25,47 @@ use std::{
 pub use io::Unblock;
 use pool::Pool;
 
-/// Runs `work` on a thread of a pool kept for blocking work, and hands back a future of what it
-/// returns.
+/// Runs `work` on a thread of a pool kept for blocking work, and returns a future of its result.
 ///
-/// This is for work that blocks: a file read, a host-name lookup, a call into a library that has
-/// no async form. Done on the thread that polls a task, such work holds up every other task that
-/// thread has to poll for as long as it takes. Done here, it holds up only the thread it runs on,
-/// and the task that awaits the future is woken once the work is over.
+/// Use it for work that blocks, such as a file read, a host-name lookup or a call into a library
+/// with no async form. If such work runs on the thread that polls tasks, it holds up every other
+/// task on that thread. Here it holds up only the pool thread that runs it. The task that awaits
+/// the future is woken when the work is done.
 ///
-/// The work is handed to the pool before this returns, not on the first poll of the future. A
-/// thread of the pool that has nothing to run takes it up. Where none is free, a thread is started
-/// for it, as long as the pool has fewer than 500; past that, the work waits its turn, behind the
-/// work handed over before it, for a thread to be done with what it runs. The future resolves to
-/// the value `work` returned as soon as the thread has handed it over.
+/// The work is submitted to the pool before `unblock` returns, not when the future is first polled.
+/// An idle pool thread takes it. If none is idle, a new thread is started, up to a limit of 500
+/// threads. Beyond that, the work waits in a queue, in submission order, until a thread is free.
 ///
-/// A thread is kept for the work that comes after its own, which spares a steady stream of work
-/// the start of a thread for each piece of it. A thread that has had nothing to run for ten seconds
-/// ends, so a pool that is no longer used holds no thread. Every thread of the pool is named
-/// `zruntime blocking work`.
+/// Pool threads are named `zruntime blocking work`. A thread is reused for later work. It exits
+/// after ten seconds with nothing to run, so an unused pool holds no threads.
 ///
-/// Work that blocks for good holds its thread for good, and once every thread of the pool is held
-/// that way, the work handed over after it waits for good as well. The pool suits work that ends
-/// of its own accord: work that waits on other work handed to the pool, or that runs for as long as
-/// the program does, is better off on a thread of its own, from [`std::thread::spawn`].
+/// Work that never ends holds its thread forever. If every pool thread is held that way, later work
+/// waits forever too. The pool suits work that ends on its own. For work that waits on other pool
+/// work, or that runs as long as the program does, use [`std::thread::spawn`] instead.
 ///
-/// The work runs to its end whether or not the future is polled, and even if the future is
-/// dropped: dropping it gives up the wait for the outcome and does not cancel the work, which
-/// nothing can stop from outside, nor take back from the pool before it starts. Nothing waits for
-/// the threads of the pool, either: work that is still going, or still waiting for a thread, when
-/// the process ends goes with it.
+/// The work runs to the end whether or not the future is polled, and even if the future is dropped.
+/// Dropping the future gives up the wait for the result. It cannot cancel the work, or remove it
+/// from the queue before it starts. Nothing waits for the pool threads, so work that is still
+/// running or queued when the process exits is lost.
 ///
-/// A panic in `work` is caught on the thread of the work, which goes on to run other work, and
-/// raised again, with the payload it had, by the poll of the future that would have returned the
-/// value, which is where whoever awaits the future sees it. A future that is dropped before that
-/// poll never sees the panic. The panic hook runs on the thread of the work as the panic happens,
-/// and does not run a second time when the panic is raised again.
-///
-/// The future needs no runtime. It is a plain [`Future`], woken through the waker of whatever
-/// polled it last, so it can be awaited under any executor, from a task on any thread.
+/// The returned future needs no runtime. It wakes the waker from its most recent poll, so it can be
+/// awaited under any executor, from a task on any thread.
 ///
 /// # Panics
 ///
-/// Panics if the pool has no thread at all and cannot start one for the work, as
-/// [`std::thread::spawn`] does when it cannot. A pool that has threads leaves the work to them
-/// instead, to take up in its turn.
+/// If `work` panics, the panic is caught on the pool thread, which carries on with other work. The
+/// poll that would have returned the value raises the panic again, with its original payload. A
+/// future that is dropped before that poll never sees the panic. The panic hook runs once, when the
+/// panic happens, and not again when the panic is raised again.
+///
+/// `unblock` itself panics if the pool has no thread and cannot start one for the work, as
+/// [`std::thread::spawn`] does when it fails. If the pool has threads, the work waits for one of
+/// them instead.
 ///
 /// # Example
 ///
-/// A sleep stands in for work that blocks. The future is driven by `block_on` from the `futures`
-/// crate, but the `block_on` of any executor would do, as `unblock` needs no runtime:
+/// A sleep stands in for blocking work. The example drives the future with `block_on` from the
+/// `futures` crate, but the `block_on` of any executor works, as `unblock` needs no runtime:
 ///
 /// ```
 /// use std::{thread, time::Duration};
@@ -93,17 +87,14 @@ where
     unblock_on(&POOL, work)
 }
 
-/// The future of the work that [`unblock()`] hands to its pool of threads: it resolves to the
-/// value the work returned.
+/// The future returned by [`unblock()`]. It resolves to the value the work returned.
 ///
-/// It needs no runtime, and works under any executor. It is `Send` and `Sync` wherever the value
-/// it resolves to is `Send`, so a task that awaits it can be moved between threads.
+/// It needs no runtime and works under any executor. It is `Send` and `Sync` if the value is
+/// `Send`, so a task that awaits it can move between threads.
 ///
-/// Dropping it before it resolves gives up the wait but not the work: the pool runs the work to
-/// its end all the same, in its turn if no thread has taken it up yet. While the work waits or
-/// runs, the pool holds nothing of the task that waited, or of the executor that ran it, so
-/// neither is kept alive by the work. Once the future has resolved, the thread that ran the work
-/// holds nothing of theirs either.
+/// Dropping it before it resolves gives up the wait, not the work. The pool still runs the work to
+/// the end, in its turn if no thread has started it yet. Once the future is dropped or has
+/// resolved, the work no longer keeps the awaiting task or its executor alive.
 pub struct BlockingWork<T>(Arc<Mutex<State<T>>>);
 
 impl<T> Future for BlockingWork<T> {

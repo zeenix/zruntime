@@ -1,5 +1,4 @@
-//! An async adapter for a blocking I/O handle, which runs each operation on the handle as blocking
-//! work.
+//! An async adapter for a blocking I/O handle, [`Unblock`].
 
 use std::{
     any::Any,
@@ -20,81 +19,96 @@ use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 
 use super::{BlockingWork, dispose, unblock};
 
-/// An async adapter for a blocking I/O handle, which runs each operation on the handle as blocking
-/// work, through [`unblock()`].
+/// An async adapter for a blocking I/O handle.
 ///
-/// The handle is anything that implements [`Read`], [`Write`], [`Seek`] or [`Iterator`]: a file,
-/// the standard input or output, a pipe to a child process, the entries of a directory. The adapter
-/// implements the [`AsyncRead`], [`AsyncWrite`] and [`AsyncSeek`] traits of `futures-io`, and the
-/// [`Stream`] trait of `futures-core`, wherever the handle implements the blocking trait each of
-/// them stands for, so that the handle can be used from async code without its calls blocking the
-/// thread that polls a task. For each operation, the adapter hands the handle over to blocking
-/// work, which hands it back along with the outcome.
+/// Each operation on the handle runs as blocking work through [`unblock()`], so the handle never
+/// blocks the thread that polls a task.
+///
+/// The handle can be anything that implements [`Read`], [`Write`], [`Seek`] or [`Iterator`]: a
+/// file, the standard input or output, a pipe to a child process, or the entries of a directory. If
+/// the handle is `Send + 'static`, the adapter implements:
+///
+/// * [`AsyncRead`] of `futures-io`, if the handle implements [`Read`].
+/// * [`AsyncWrite`] of `futures-io`, if it implements [`Write`].
+/// * [`AsyncSeek`] of `futures-io`, if it implements [`Seek`].
+/// * [`Stream`] of `futures-core`, if it is an [`Iterator`] whose items are `Send + 'static`.
 ///
 /// Like [`unblock()`], the adapter needs no runtime and works under any executor. It is `Send` and
-/// `Sync` wherever the handle is `Send`, and `Unpin` whatever the handle is.
+/// `Sync` if the handle is `Send`, and it is always `Unpin`.
 ///
 /// # One operation at a time
 ///
-/// The adapter runs one operation on the handle at a time, and an operation waits for the one
-/// before it to be over, whichever way either of them goes: a write waits for a read in flight, and
-/// a read for a write. Two tasks may wait at once, as the reading and the writing half of a split
-/// adapter do, and both are woken when the operation is over, even where the waker of one of them
-/// panics. A file is none the worse for that, but a handle that reads and writes two separate
-/// streams, as a socket or a serial port does, can wait for good: a read that waits for the other
-/// end to send something holds up a write that the other end waits for first.
+/// The adapter runs one operation on the handle at a time. Each operation waits for the one in
+/// progress to finish, whether that is a read, a write or anything else. A read that is served from
+/// bytes already read ahead does not wait.
+///
+/// Two tasks can wait at once, for example the two halves of a split adapter. Both are woken when
+/// the operation ends, even if one of the wakers panics.
+///
+/// This is harmless for a file. It can deadlock a handle with separate read and write streams, such
+/// as a socket or a serial port. A read that waits for the peer to send data blocks a write that
+/// the peer is waiting for first.
 ///
 /// # Reading
 ///
-/// A read reads up to the capacity of the adapter from the handle, whatever the size of the buffer
-/// it was given, and what that buffer does not take is kept for the reads that follow. The handle's
-/// own position is thus ahead of what the reads have handed out. A seek accounts for that, one from
-/// [`SeekFrom::Current`] included, but a write does not: on a handle whose reads and writes share
-/// one position, as those of a file do, seek to `SeekFrom::Current(0)` before writing after a read,
-/// which brings the handle's position back to where the reads got to. The bytes read ahead are kept
-/// across writes, so that a handle with two separate streams loses none of those it read.
+/// A read from the handle reads up to the adapter's capacity, whatever the size of the buffer it
+/// was given. The bytes the buffer does not take are kept for the reads that follow. So the
+/// handle's own position is ahead of what the reads have returned.
+///
+/// A seek accounts for this, including a seek from [`SeekFrom::Current`]. A write does not. If the
+/// handle's reads and writes share one position, as a file's do, seek to `SeekFrom::Current(0)`
+/// before writing after a read. That moves the handle's position back to where the reads got to.
+///
+/// The bytes read ahead are kept across writes. A handle with two separate streams loses none of
+/// the bytes it read.
 ///
 /// # Writing
 ///
-/// A write takes as many of the bytes it was given as the capacity allows, and completes as soon as
-/// it has handed them over to blocking work that writes every one of them to the handle. The
-/// operation after it waits for that work to be over, and an error the work ran into is reported by
-/// the next write or flush. A flush waits for the bytes of the write before it to be written, then
-/// flushes the handle. Closing the adapter flushes it and leaves the handle open: the handle is
-/// closed when it is dropped, along with the adapter or after [`into_inner`](Unblock::into_inner).
+/// A write takes as many of the given bytes as the capacity allows. It completes as soon as it has
+/// passed them to blocking work, which writes all of them to the handle. The next operation waits
+/// for that work to finish. If the work failed, the next write or flush returns the error.
 ///
-/// No byte a write took waits on the adapter to go to the handle. Dropping the adapter gives up the
-/// wait for the write in flight, not the write itself, which runs to its end as the work of
-/// [`unblock()`] does; an error it runs into then goes unreported, so flush the adapter before
-/// dropping it to learn of any.
+/// A flush waits for the earlier writes to finish, then flushes the handle. Closing the adapter
+/// flushes it but leaves the handle open. The handle is closed when it is dropped, either with the
+/// adapter or after [`into_inner`](Unblock::into_inner).
+///
+/// Once a write completes, its bytes no longer depend on the adapter. Dropping the adapter gives up
+/// the wait for the write in progress, not the write itself. The bytes are still written, as for
+/// [`unblock()`], but an error goes unreported. Flush the adapter before dropping it to learn of
+/// errors.
 ///
 /// # Iterating
 ///
-/// Items are pulled from the iterator a batch at a time, by blocking work that pulls as many as the
-/// capacity, or 16 where the capacity is larger, or until the iterator ends, and the stream hands
-/// them out one by one. The first item of a batch thus waits for the last, which matters for an
-/// iterator whose items are slow to come, such as the lines of the standard input: a capacity of 1
-/// has each of them handed out as soon as it comes. The stream ends where the iterator does, and
-/// polled again after that, pulls from the iterator again.
+/// The stream pulls items from the iterator in batches, in one piece of blocking work, and yields
+/// them one at a time. A batch holds as many items as the capacity, but at most 16, or fewer if the
+/// iterator ends first.
+///
+/// The first item of a batch is therefore delayed until the whole batch has been pulled. This
+/// matters for iterators with slow items, such as the lines of the standard input. With a capacity
+/// of 1, each item is yielded as soon as it arrives.
+///
+/// The stream yields `None` when the iterator ends. If it is polled again after that, it pulls from
+/// the iterator again.
 ///
 /// # Using the handle directly
 ///
 /// [`get_mut`](Unblock::get_mut), [`with_mut`](Unblock::with_mut) and
-/// [`into_inner`](Unblock::into_inner) hand the handle over for use as it is, once the operation in
-/// flight is over. They drop the bytes read ahead and the items pulled ahead: the handle is past
-/// them, and nothing done to it directly can be accounted for.
+/// [`into_inner`](Unblock::into_inner) give access to the handle itself, once the operation in
+/// progress has finished. They drop the bytes read ahead and the items pulled ahead. These are
+/// lost: the handle is already past them, and the adapter cannot know what is done to the handle
+/// directly.
 ///
 /// # Panics
 ///
-/// A panic in an operation on the handle is raised again, with the payload it had, by the poll that
-/// waits for that operation, as it is for [`unblock()`]. The handle goes with the panic, and any
-/// use of the adapter after it panics as well.
+/// If an operation on the handle panics, the poll that waits for it raises the panic again with its
+/// original payload, as for [`unblock()`]. The handle is lost with the panic, and any later use of
+/// the adapter panics too.
 ///
 /// # Examples
 ///
 /// A [`Cursor`](std::io::Cursor) stands in for a blocking handle to read, and a `Vec` for one to
-/// write. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of any
-/// executor would do, as the adapter needs no runtime:
+/// write. The examples drive the futures with `block_on` from the `futures` crate, but the
+/// `block_on` of any executor works, as the adapter needs no runtime:
 ///
 /// ```
 /// use std::io::Cursor;
@@ -118,9 +132,8 @@ use super::{BlockingWork, dispose, unblock};
 /// .unwrap();
 /// ```
 ///
-/// The standard input, read line by line as the lines come in, through a `BufReader` of the
-/// `futures` crate and the `lines` of its `AsyncBufReadExt`. A `Cursor` stands in for
-/// `std::io::stdin()` here:
+/// Reading the standard input line by line, as the lines arrive, through a `BufReader` and `lines`
+/// from the `futures` crate. A `Cursor` stands in for `std::io::stdin()`:
 ///
 /// ```
 /// use std::io::Cursor;
@@ -148,19 +161,19 @@ pub struct Unblock<T> {
 }
 
 impl<T> Unblock<T> {
-    /// An adapter for `io`, with the default capacity of 8 KiB.
+    /// Creates an adapter for `io` with the default capacity of 8 KiB.
     ///
-    /// See [`with_capacity`](Unblock::with_capacity) for what the capacity is.
+    /// See [`with_capacity`](Unblock::with_capacity) for what the capacity means.
     pub fn new(io: T) -> Self {
         Self::with_capacity(DEFAULT_CAPACITY, io)
     }
 
-    /// An adapter for `io`, with a capacity of `cap`.
+    /// Creates an adapter for `io` with a capacity of `cap`.
     ///
-    /// The capacity is the most bytes that one operation on the handle reads ahead or writes, and
-    /// the most items, up to 16, that one pulls from an iterator. A larger one has the handle read
-    /// and written in fewer and larger calls, at the cost of memory: the adapter keeps a buffer of
-    /// that size for the reads, and one for the writes, once there have been any.
+    /// The capacity is the most bytes that one operation reads ahead or writes. It is also the most
+    /// items that one operation pulls from an iterator, with an upper limit of 16. A larger
+    /// capacity means fewer and larger calls on the handle, at the cost of memory. Once the adapter
+    /// has read or written, it keeps one buffer of that size for reads and one for writes.
     pub fn with_capacity(cap: NonZeroUsize, io: T) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -175,12 +188,13 @@ impl<T> Unblock<T> {
         }
     }
 
-    /// The handle, borrowed mutably once the operation in flight is over.
+    /// Borrows the handle mutably, once the operation in progress has finished.
     ///
-    /// By then, every byte a write took has been handed to the handle, though the handle may still
-    /// hold some of them in a buffer of its own. An error the last write ran into, if no write or
-    /// flush has reported it yet, is kept for the next one. The bytes read ahead and the items
-    /// pulled ahead are dropped: see
+    /// By then, every byte a write took has been passed to the handle, though the handle may still
+    /// buffer some of them itself. If the last write failed and no write or flush has reported the
+    /// error yet, it is kept for the next write or flush.
+    ///
+    /// The bytes read ahead and the items pulled ahead are dropped. See
     /// [using the handle directly](Unblock#using-the-handle-directly).
     ///
     /// # Example
@@ -213,23 +227,23 @@ impl<T> Unblock<T> {
         handle
     }
 
-    /// Runs `op` on the handle as blocking work, once the operation in flight is over, and hands
-    /// back what `op` returned.
+    /// Runs `op` on the handle as blocking work, once the operation in progress has finished, and
+    /// returns what `op` returns.
     ///
-    /// This is for what the async traits do not cover: the metadata of a file, say, or its length
-    /// to set. As with [`get_mut`](Unblock::get_mut), every byte a write took has been handed to
-    /// the handle before `op` runs, an error the last write ran into is kept for the next write or
-    /// flush, and the bytes read ahead and the items pulled ahead are dropped.
+    /// Use it for what the async traits do not cover, for example reading a file's metadata or
+    /// setting its length. As with [`get_mut`](Unblock::get_mut), every byte a write took has been
+    /// passed to the handle before `op` runs. An error from the last write is kept for the next
+    /// write or flush. The bytes read ahead and the items pulled ahead are dropped.
     ///
-    /// Once `op` has started, nothing can stop it: dropping the future then gives up the wait for
-    /// `op`, which runs to its end, and the next operation waits for it and drops what it
-    /// returned. A future dropped before `op` started, while it waited for the operation before,
-    /// never runs it.
+    /// Once `op` has started, nothing can stop it. Dropping the future gives up the wait, but `op`
+    /// still runs to the end. The next operation waits for it and discards what it returned. If the
+    /// future is dropped before `op` starts, while it waits for the operation in progress, `op`
+    /// never runs.
     ///
     /// # Panics
     ///
-    /// A panic in `op` is raised again by the poll of the future that would have returned its
-    /// value, and the adapter loses the handle with it, as for any operation on the handle.
+    /// If `op` panics, the poll of the future that would have returned its value raises the panic
+    /// again. The adapter loses the handle, as for any operation on it.
     ///
     /// # Example
     ///
@@ -266,12 +280,12 @@ impl<T> Unblock<T> {
         }
     }
 
-    /// The handle, out of the adapter once the operation in flight is over.
+    /// Takes the handle out of the adapter, once the operation in progress has finished.
     ///
-    /// By then, every byte a write took has been handed to the handle, though the handle may still
-    /// hold some of them in a buffer of its own. An error the last write ran into, if no write or
-    /// flush has reported it yet, is lost: flush the adapter first to learn of it. So are the bytes
-    /// read ahead and the items pulled ahead: see
+    /// By then, every byte a write took has been passed to the handle, though the handle may still
+    /// buffer some of them itself. If the last write failed and no write or flush has reported the
+    /// error yet, the error is lost, so flush the adapter first to learn of it. The bytes read
+    /// ahead and the items pulled ahead are lost too. See
     /// [using the handle directly](Unblock#using-the-handle-directly).
     ///
     /// # Example

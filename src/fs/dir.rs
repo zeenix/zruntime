@@ -1,5 +1,4 @@
-//! The directories of [`fs`](super): the stream of the entries of one, an entry, and the builder of
-//! new ones.
+//! The directory types of [`fs`](super): [`ReadDir`], [`DirEntry`] and [`DirBuilder`].
 
 use std::{
     ffi::OsString,
@@ -17,16 +16,16 @@ use futures_core::Stream;
 use super::{FileType, Metadata, sealed::Sealed};
 use crate::{Unblock, unblock};
 
-/// The stream of the entries of a directory, from [`read_dir()`](super::read_dir).
+/// A stream of the entries of a directory, created by [`read_dir()`](super::read_dir).
 ///
 /// It yields an [`io::Result`] of a [`DirEntry`] for each entry, and ends after the last one. The
-/// directory is read as the stream is, so an error can come up in the middle of it, and the
-/// entries are in no particular order. `.` and `..` are not among them.
+/// directory is read as the stream is polled, so an error can occur in the middle. The entries are
+/// in no particular order. `.` and `..` are not among them.
 ///
-/// The stream is an [`Unblock`] over the directory of std, and so pulls a batch of entries from it
-/// in one piece of blocking work, up to 16, and hands them out one by one. A directory is thus read
-/// a little ahead of the entries that the stream has yielded, and an entry made after it was read
-/// from may or may not be in the stream. [`read_dir()`](super::read_dir) has an example.
+/// The stream is an [`Unblock`] over the directory of std. It pulls up to 16 entries in one piece
+/// of blocking work and yields them one by one. So the directory is read slightly ahead of the
+/// entries the stream has yielded, and an entry created after that read may or may not appear. See
+/// [`read_dir()`](super::read_dir) for an example.
 pub struct ReadDir(Unblock<std::fs::ReadDir>);
 
 impl ReadDir {
@@ -51,46 +50,48 @@ impl fmt::Debug for ReadDir {
     }
 }
 
-/// An entry of a directory, as the stream of [`read_dir()`](super::read_dir) yields it.
+/// An entry of a directory, yielded by the [`ReadDir`] stream.
 ///
-/// The name of the entry and the path to it are known from the stream, and are read without
-/// waiting. What more there is to know of the entry, its [metadata](DirEntry::metadata) and its
-/// [type](DirEntry::file_type), is read by blocking work, as the OS may have to go to the disk for
-/// it. On unix, the `DirEntryExt` trait of the `unix` module adds the inode number.
+/// The name and the path of the entry are already known and are read without waiting. Its
+/// [metadata](DirEntry::metadata) and [type](DirEntry::file_type) can need disk access, so they are
+/// read as blocking work. On unix, the `DirEntryExt` trait of the `unix` module adds the inode
+/// number.
 ///
-/// An entry is cheap to clone: the clones share the entry of std.
+/// Cloning an entry is cheap. The clones share the entry of std.
 #[derive(Clone)]
 pub struct DirEntry(Arc<std::fs::DirEntry>);
 
 impl DirEntry {
-    /// The full path of the entry: the path that was given to [`read_dir()`](super::read_dir),
-    /// joined with the name of the entry.
+    /// The full path of the entry: the path given to [`read_dir()`](super::read_dir), joined with
+    /// the name of the entry.
     pub fn path(&self) -> PathBuf {
         self.0.path()
     }
 
-    /// The name of the entry alone, without the path of the directory it is in.
+    /// The name of the entry, without the path of the directory it is in.
     pub fn file_name(&self) -> OsString {
         self.0.file_name()
     }
 
     /// Reads the metadata of the entry itself, without following a symbolic link.
     ///
-    /// This is [`std::fs::DirEntry::metadata`], run as blocking work. For an entry that is a
-    /// symbolic link, it describes the link, not what the link points at: the metadata of that is
-    /// what [`metadata`](super::metadata) of the entry's [`path`](DirEntry::path) reads. It fails
-    /// if the entry has been removed since the directory was read.
+    /// Runs [`std::fs::DirEntry::metadata`] as blocking work. For a symbolic link, it describes the
+    /// link and not its target. To read the metadata of the target, call
+    /// [`metadata`](super::metadata) with the [`path`](DirEntry::path) of the entry.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the entry was removed after the directory was read.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         let entry = self.0.clone();
         unblock(move || entry.metadata()).await
     }
 
-    /// Reads the type of the entry: a file, a directory or a symbolic link, without following the
-    /// link.
+    /// Reads the type of the entry (file, directory or symbolic link), without following a link.
     ///
-    /// This is [`std::fs::DirEntry::file_type`], run as blocking work. Most platforms hand the type
-    /// over with the entry, which makes it a short piece of work, but not all do, and so it is
-    /// always run as blocking work.
+    /// Runs [`std::fs::DirEntry::file_type`] as blocking work. Most platforms return the type
+    /// together with the entry, which makes this a short piece of work. Not all do, so it always
+    /// runs as blocking work.
     pub async fn file_type(&self) -> io::Result<FileType> {
         let entry = self.0.clone();
         unblock(move || entry.file_type()).await
@@ -112,11 +113,11 @@ impl super::unix::DirEntryExt for DirEntry {
     }
 }
 
-/// A builder of directories, with the options for how they are made.
+/// A builder of directories, with options for how they are created.
 ///
-/// The options are set on the builder, and then [`create`](DirBuilder::create) makes a directory
-/// with them, any number of times. On unix, the `DirBuilderExt` trait of the `unix` module adds the
-/// permission bits a new directory gets.
+/// Set the options on the builder, then call [`create`](DirBuilder::create) to create a directory
+/// with them. A builder can create any number of directories. On unix, the `DirBuilderExt` trait of
+/// the `unix` module adds the permission bits of new directories.
 ///
 /// # Example
 ///
@@ -148,27 +149,26 @@ pub struct DirBuilder {
 }
 
 impl DirBuilder {
-    /// A builder with the options of std's: `recursive` is off.
+    /// Creates a builder with the defaults of std: `recursive` is off.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets whether the directory made has its missing parents made as well, and whether a
-    /// directory that is there already is no error, as [`create_dir_all`](super::create_dir_all)
-    /// has it.
+    /// Sets whether missing parent directories are created as well.
     ///
-    /// The parents are made with the same options as the directory itself. This is off for a new
-    /// builder.
+    /// If set, it is also not an error if the directory already exists, as with
+    /// [`create_dir_all`](super::create_dir_all). The parents are created with the same options as
+    /// the directory itself. This is off by default.
     pub fn recursive(&mut self, recursive: bool) -> &mut Self {
         self.recursive = recursive;
         self
     }
 
-    /// Makes the directory at `path` with the options of the builder.
+    /// Creates the directory at `path` with the options of the builder.
     ///
-    /// This is [`std::fs::DirBuilder::create`], run as blocking work. The future does not borrow
-    /// the builder, which can be changed or dropped as soon as this returns, and does nothing until
-    /// it is polled.
+    /// Runs [`std::fs::DirBuilder::create`] as blocking work. The returned future does not borrow
+    /// the builder, so the builder can be changed or dropped right away. The future does nothing
+    /// until it is polled.
     pub fn create<P>(&self, path: P) -> impl Future<Output = io::Result<()>> + use<P>
     where
         P: AsRef<Path>,

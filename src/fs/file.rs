@@ -1,4 +1,4 @@
-//! [`File`], an open file whose reads and writes are blocking work.
+//! [`File`], an open file with async reads and writes.
 
 use std::{
     fmt, future,
@@ -20,60 +20,63 @@ use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use super::{Metadata, Permissions};
 use crate::{Unblock, lock::Mutex, unblock};
 
-/// An open file, whose reads, writes and seeks are blocking work on the pool of threads that
-/// [`unblock()`] hands its work to.
+/// An open file whose reads, writes and seeks run as blocking work.
 ///
-/// A file is opened by [`open`](File::open), [`create`](File::create) or
-/// [`OpenOptions`](super::OpenOptions), or made from one of std's with [`From`]. It implements
-/// `futures-io`'s [`AsyncRead`], [`AsyncWrite`] and [`AsyncSeek`] by way of an
-/// [`Unblock`](crate::Unblock) over the file, and the methods that std's file has on top of those
-/// are here as `async` methods. Like [`unblock()`], it needs no runtime and works under any
-/// executor. It is `Send` and `Sync`, and `Unpin`.
+/// Open a file with [`open`](File::open), [`create`](File::create) or
+/// [`OpenOptions`](super::OpenOptions), or convert a [`std::fs::File`] with [`From`]. `File`
+/// implements `futures-io`'s [`AsyncRead`], [`AsyncWrite`] and [`AsyncSeek`] through an
+/// [`Unblock`](crate::Unblock) over the file. The other methods of std's file are `async` methods
+/// here.
 ///
-/// The file is closed when it is dropped, and an error that closing it runs into is lost:
-/// [`sync_all`](File::sync_all) learns of any before that.
+/// Like [`unblock()`], it needs no runtime and works under any executor. It is `Send`, `Sync` and
+/// `Unpin`.
+///
+/// The file is closed when it is dropped. An error from closing it is lost, so call
+/// [`sync_all`](File::sync_all) before dropping the file to learn of one.
 ///
 /// # Reading
 ///
 /// A read has the pool read up to 64 KiB from the file at once, whatever the size of the buffer it
-/// was given, and keeps what the buffer does not take for the reads that follow. The position the
-/// OS keeps for the file is thus ahead of where the reads got to. The position a seek reports and
-/// seeks from, `SeekFrom::Current` included, is where the reads got to, and so is the one a write
-/// goes to: the file has the OS position put back there before it writes, if it was read from since
-/// it was last put right.
+/// was given. The bytes the buffer does not take are kept for the reads that follow. So the
+/// position the OS keeps for the file is ahead of where the reads got to.
+///
+/// The position that a seek reports and seeks from, including `SeekFrom::Current`, is where the
+/// reads got to. A write goes there too. If the file was read from since its position was last put
+/// right, it moves the OS position back there before it writes.
 ///
 /// # Writing
 ///
-/// A write takes up to 64 KiB of the bytes it was given, and is done as soon as it has handed them
-/// to the pool, which writes every one of them to the file. The operation after it, of any kind,
-/// waits for that work to be over first, so the bytes are written in the order they were given in,
-/// and a file is read as it was written. An error that the work ran into is reported by the next
-/// write or flush, and [`flush`](futures_io::AsyncWrite::poll_flush) waits for every write before
-/// it to be over.
+/// A write takes up to 64 KiB of the given bytes. It completes as soon as it has passed them to the
+/// pool, which writes all of them to the file. The next read, write, seek or flush waits for that
+/// work to finish first. So the bytes are written in the order they were given, and a file reads
+/// back what was written. If the work failed, the next write or flush returns the error. A
+/// [flush](futures_io::AsyncWrite::poll_flush) waits for every earlier write to finish.
 ///
-/// Once a write is done, then, the pool has its bytes, and nothing of it waits on the file. A file
-/// that is dropped right after a write stays open until the pool is done with it, and every byte
-/// is in the file by then, but an error goes unreported: flush the file, or call
-/// [`sync_all`](File::sync_all), before dropping it to learn of any. The same goes for a file that
-/// is dropped by a task that is cancelled.
+/// Once a write completes, the pool holds its bytes and nothing waits on the file. If the file is
+/// dropped right after a write, it stays open until the pool is done with it, and every byte
+/// reaches the file, but an error goes unreported. To learn of errors, flush the file or call
+/// [`sync_all`](File::sync_all) before dropping it. The same applies to a file dropped by a task
+/// that is cancelled.
 ///
 /// The methods that look at the file or change it as a whole, [`sync_all`](File::sync_all),
 /// [`sync_data`](File::sync_data), [`set_len`](File::set_len) and [`metadata`](File::metadata),
-/// take `&self`, and each first waits for the writes before it to be over, and reports the error of
-/// one that failed, as a flush does. Calls of them from several tasks at once take turns.
+/// take `&self`. Each first waits for the earlier writes to finish, and returns the error of a
+/// failed one, as a flush does. When several tasks call them at once, the tasks take turns waiting
+/// for the writes.
 ///
 /// # Raw handles
 ///
-/// The file can be given out as a raw file descriptor or handle, for a call that std or the OS has
-/// and this type does not. Whatever is done with it behind the file's back is not accounted for:
-/// the position of the file may be ahead of where the reads got to, as said above, and the writes
-/// that are in flight are not waited for.
+/// On unix, the file implements `AsFd` and `AsRawFd`. On Windows, it implements `AsHandle` and
+/// `AsRawHandle`. They give the raw descriptor or handle, for calls that std or the OS has and this
+/// type does not. The file does not account for anything done through them. The OS position can be
+/// ahead of where the reads got to, as described above, and the file does not wait for writes in
+/// progress.
 ///
 /// # Example
 ///
-/// A file written and then read through the same handle, from a position it seeks to. The futures
-/// are driven by `block_on` from the `futures` crate, but the `block_on` of any executor would do,
-/// as the file needs no runtime:
+/// This example writes to a file, then reads it through the same handle from a position it seeks
+/// to. It drives the futures with `block_on` from the `futures` crate, but the `block_on` of any
+/// executor works, as the file needs no runtime:
 ///
 /// ```
 /// use std::io::SeekFrom;
@@ -93,7 +96,7 @@ use crate::{Unblock, lock::Mutex, unblock};
 ///         .await?;
 ///
 ///     file.write_all(b"hello, world").await?;
-///     // The length includes the bytes written, though no flush asked for them to be waited for.
+///     // The length includes the bytes written, even though the file was not flushed.
 ///     assert_eq!(file.metadata().await?.len(), 12);
 ///
 ///     file.seek(SeekFrom::Start(7)).await?;
@@ -107,7 +110,7 @@ use crate::{Unblock, lock::Mutex, unblock};
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
 ///
-/// A write that follows a read lands where the reads got to, not where the read ahead of them did:
+/// A write that follows a read lands where the reads got to, not where the read-ahead got to:
 ///
 /// ```
 /// use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
@@ -149,9 +152,12 @@ pub struct File {
 impl File {
     /// Opens the file at `path` for reading.
     ///
-    /// This is [`std::fs::File::open`], run as blocking work. It fails if there is no file at
-    /// `path`, and if the process may not read it. [`OpenOptions`](super::OpenOptions) opens a file
-    /// in other ways.
+    /// Runs [`std::fs::File::open`] as blocking work. To open a file in other ways, use
+    /// [`OpenOptions`](super::OpenOptions).
+    ///
+    /// # Errors
+    ///
+    /// Fails if there is no file at `path`, or if the process may not read it.
     pub async fn open<P>(path: P) -> io::Result<File>
     where
         P: AsRef<Path>,
@@ -161,12 +167,16 @@ impl File {
         Ok(File::from(file))
     }
 
-    /// Opens the file at `path` for writing, creating it if it is not there and emptying it if it
-    /// is.
+    /// Opens the file at `path` for writing, creating it if it does not exist and emptying it if it
+    /// does.
     ///
-    /// This is [`std::fs::File::create`], run as blocking work. It fails if the directory of the
-    /// file does not exist, and if the process may not write to it. The file cannot be read
-    /// through the handle: [`OpenOptions`](super::OpenOptions) opens one that can.
+    /// Runs [`std::fs::File::create`] as blocking work. The file cannot be read through the
+    /// returned handle. To open one that can, use [`OpenOptions`](super::OpenOptions).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the directory of the file does not exist, or if the process may not write to the
+    /// file.
     pub async fn create<P>(path: P) -> io::Result<File>
     where
         P: AsRef<Path>,
@@ -176,12 +186,12 @@ impl File {
         Ok(File::from(file))
     }
 
-    /// Waits for the writes so far to reach the file, then has the OS write the data and the
-    /// metadata of the file to the disk.
+    /// Waits for the writes so far to reach the file, then asks the OS to write the data and
+    /// metadata of the file to disk.
     ///
-    /// This is [`std::fs::File::sync_all`], run as blocking work after a flush. It is what tells
-    /// whether the file reached the disk, and what reports an error that a write or the closing of
-    /// the file would otherwise lose.
+    /// Runs [`std::fs::File::sync_all`] as blocking work after a flush. It tells whether the file
+    /// reached the disk. It also reports an error that a write, or closing the file, would
+    /// otherwise lose.
     ///
     /// # Example
     ///
@@ -208,10 +218,11 @@ impl File {
         unblock(move || file.sync_all()).await
     }
 
-    /// Waits for the writes so far to reach the file, then has the OS write the data of the file
-    /// to the disk, and the metadata only where it is needed to read the data back.
+    /// Waits for the writes so far to reach the file, then asks the OS to write the data of the
+    /// file to disk.
     ///
-    /// This is [`std::fs::File::sync_data`], run as blocking work after a flush. It does less than
+    /// Runs [`std::fs::File::sync_data`] as blocking work after a flush. The metadata is written
+    /// only if it is needed to read the data back. This does less than
     /// [`sync_all`](File::sync_all) on a platform that can tell the two apart, and the same on one
     /// that cannot.
     pub async fn sync_data(&self) -> io::Result<()> {
@@ -220,13 +231,13 @@ impl File {
         unblock(move || file.sync_data()).await
     }
 
-    /// Waits for the writes so far to reach the file, then cuts the file short or extends it to
-    /// `size` bytes.
+    /// Waits for the writes so far to reach the file, then truncates or extends the file to `size`
+    /// bytes.
     ///
-    /// This is [`std::fs::File::set_len`], run as blocking work after a flush. A file that is
-    /// extended is filled with zeros. The position of the file stays where it is, even if that is
-    /// past the new end, and the reads after this see the file as it now is, from there: what the
-    /// reads before it read ahead, of the file as it was, is dropped.
+    /// Runs [`std::fs::File::set_len`] as blocking work after a flush. An extended file is filled
+    /// with zeros. The position of the file does not change, even if it is now past the end. The
+    /// bytes that earlier reads read ahead are dropped, so later reads see the file as it is now,
+    /// from that position.
     pub async fn set_len(&self, size: u64) -> io::Result<()> {
         let mut adapter = self.unblock.lock().await;
         future::poll_fn(|cx| Pin::new(&mut *adapter).poll_flush(cx)).await?;
@@ -246,8 +257,8 @@ impl File {
 
     /// Waits for the writes so far to reach the file, then reads the metadata of the file.
     ///
-    /// This is [`std::fs::File::metadata`], run as blocking work after a flush, so that the length
-    /// it reports includes every byte written before the call.
+    /// Runs [`std::fs::File::metadata`] as blocking work after a flush, so the length it reports
+    /// includes every byte written before the call.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         self.flush_writes().await?;
         let file = self.file.clone();
@@ -256,8 +267,8 @@ impl File {
 
     /// Changes the permissions of the file to `perm`.
     ///
-    /// This is [`std::fs::File::set_permissions`], run as blocking work. What it changes does not
-    /// depend on the bytes written, so unlike the methods above it does not wait for them.
+    /// Runs [`std::fs::File::set_permissions`] as blocking work. Unlike the methods above, it does
+    /// not wait for earlier writes, because the permissions do not depend on the bytes written.
     pub async fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         let file = self.file.clone();
         unblock(move || file.set_permissions(perm)).await
@@ -296,7 +307,7 @@ impl fmt::Debug for File {
 }
 
 impl From<std::fs::File> for File {
-    /// The file of std as an async one, from the position it is at.
+    /// Converts a [`std::fs::File`] into an async `File`, keeping its current position.
     fn from(file: std::fs::File) -> Self {
         let file = Arc::new(file);
         Self {

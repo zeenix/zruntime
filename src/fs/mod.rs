@@ -1,45 +1,38 @@
-//! Async access to the filesystem, as blocking work on the pool of threads that [`unblock()`] hands
-//! its work to.
+//! Async access to the filesystem, in the shape of [`std::fs`].
 //!
-//! A file cannot be waited on for readiness the way a socket can. An OS either cannot watch a
-//! regular file at all, as Linux cannot, or reports it ready whether or not the disk has its data
-//! at hand, and the call that follows blocks the thread for as long as the disk takes. Made from
-//! the thread that polls a task, such a call holds up every other task that thread has to poll, so
-//! each operation of this module is blocking work instead: it is handed to the pool through
-//! [`unblock()`], and the task that awaits it is woken once it is over. The module needs no
-//! runtime, and works under any executor, as [`unblock()`] does.
+//! Each operation runs as blocking work through [`unblock()`], on the same pool, so it does not
+//! block the thread that polls a task. A regular file cannot be waited on for readiness as a socket
+//! can, so blocking work is how files are kept off that thread. The module needs no runtime and
+//! works under any executor.
 //!
-//! It has the shape of [`std::fs`]. The functions of the same names, from [`read`] to [`write()`],
-//! take their paths by `AsRef<Path>` and fail with the errors of the function of std they run; the
-//! types of the same names, [`OpenOptions`], [`DirBuilder`], [`DirEntry`] and [`File`], are
-//! built and used alike. What a function or a type has of the platform it runs on, the permission
-//! bits of a new file or the flags a file is opened with, comes with the extension traits in the
-//! `unix` and `windows` modules, each present on its own platform alone, and is the same as in
-//! std. Code written against `smol::fs` is ported to this module by changing the path.
+//! The functions have the names of the ones in std, from [`read`] to [`write()`]. They take paths
+//! as `AsRef<Path>` and fail with the errors of the std function they run. [`OpenOptions`],
+//! [`DirBuilder`], [`DirEntry`] and [`File`] are built and used like their std counterparts.
+//! Platform-specific options come from extension traits in the `unix` and `windows` modules, each
+//! present only on its own platform. They match the extension traits of std. Code written for
+//! `smol::fs` usually needs only a changed import path.
 //!
-//! # Handing the work over
+//! # Dropping a future
 //!
-//! A function converts its arguments to owned values before it first waits, so that the work does
-//! not borrow from the task, and hands the work to the pool when its future is first polled. From
-//! then on the work runs to its end whether or not the future is polled, and even if the future is
-//! dropped: dropping a future gives up the wait for the outcome, not the work, which nothing can
-//! stop from outside. A [`remove_dir_all`] that is given up on goes on removing, and a [`write()`]
-//! writes. Where the work is a single call, it is done or not done; where it is many, as in a
-//! removal, a crash or a full disk may leave it half done, as it would in std.
+//! Each function converts its arguments to owned values and submits its work to the pool when its
+//! future is first polled. From then on the work runs to the end, even if the future is no longer
+//! polled or is dropped. Dropping a future gives up the wait for the result, not the work. A
+//! [`remove_dir_all`] that is dropped keeps removing, and a [`write()`] still writes.
+//!
+//! If the work is a single call, it is either done or not done. If it is many calls, as in a
+//! recursive removal, a crash or a full disk can leave it half done, as in std.
 //!
 //! # Files
 //!
-//! A [`File`] reads and writes through [`Unblock`](crate::Unblock), the adapter that runs each
-//! operation on a blocking handle as blocking work, and so implements `futures-io`'s `AsyncRead`,
-//! `AsyncWrite` and `AsyncSeek`. A read reads ahead of the buffer it was given, and a write is done
-//! once its bytes are handed to the pool: [`File`] says what that means for the file and for the
-//! bytes written when the file is dropped.
+//! A [`File`] reads and writes through [`Unblock`](crate::Unblock), so it implements the
+//! `AsyncRead`, `AsyncWrite` and `AsyncSeek` traits of `futures-io`. A read reads ahead of the
+//! buffer it was given. A write completes once its bytes are passed to the pool. The [`File`] docs
+//! explain what that means for the file, and for bytes written when it is dropped.
 //!
 //! # Example
 //!
-//! The paths of the example are in a directory made for it, which stands in for the directory of a
-//! program. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of
-//! any executor would do, as the module needs no runtime:
+//! The example works in a directory created for it. It drives the futures with `block_on` from the
+//! `futures` crate, but the `block_on` of any executor works, as the module needs no runtime:
 //!
 //! ```
 //! use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
@@ -71,26 +64,22 @@
 //! # std::fs::remove_dir_all(&dir).unwrap();
 //! ```
 //!
-//! # Difference with `async-fs`
+//! # Differences from `async-fs`
 //!
-//! This module is modelled on [`async-fs`], the crate behind `smol::fs`, and differs from it in
-//! these places:
+//! This module is modelled on [`async-fs`], the crate behind `smol::fs`. It differs in these ways:
 //!
-//! * It is built on the pool and the adapter of this crate, not on those of `blocking`. A thread of
-//!   the pool is kept for ten seconds after its work, and there are at most 500 of them: see
-//!   [`unblock()`].
-//! * [`File::metadata`] waits for the bytes written to the file to reach it, as [`File::sync_all`]
-//!   and [`File::set_len`] do, so the length it reports includes every write that was done before
-//!   it. In `async-fs`, it reports the file as it is at that moment, which may be short of a write
-//!   still on its way.
-//! * [`File`] keeps no logical position and no flag of its own for a write that is yet to be
-//!   flushed. The adapter knows where the reads got to, so the only thing the file has to do is say
-//!   that a write comes after a read, and a flush is always passed on: one for a file that was not
-//!   written to costs a hand-over and does nothing else.
-//! * The [`ReadDir`] stream pulls up to 16 entries from the directory in one hand-over, where
-//!   `async-fs` hands over once per entry.
-//! * The futures of [`DirBuilder::create`] and [`OpenOptions::open`] do nothing until polled, as
-//!   those of the functions do, where those of `async-fs` start the work of the first at once.
+//! * It uses this crate's pool and adapter, not those of `blocking`. An idle pool thread exits
+//!   after ten seconds, and there are at most 500 threads. See [`unblock()`].
+//! * [`File::metadata`] waits for the bytes written so far to reach the file, as [`File::sync_all`]
+//!   and [`File::set_len`] do. The length it reports includes every earlier write. In `async-fs`,
+//!   it reports the file as it is at that moment, which may be short of a write still in progress.
+//! * [`File`] does not track a logical position or whether a write is waiting to be flushed. A
+//!   flush always goes to the pool, so flushing a file that was never written to costs one piece of
+//!   blocking work and does nothing else.
+//! * [`ReadDir`] pulls up to 16 entries from the directory per piece of blocking work. `async-fs`
+//!   does one per entry.
+//! * The futures of [`DirBuilder::create`] and [`OpenOptions::open`] do nothing until polled, like
+//!   those of the functions. In `async-fs`, the first starts its work at once.
 //!
 //! [`async-fs`]: https://crates.io/crates/async-fs
 
@@ -118,8 +107,11 @@ use crate::unblock;
 /// Resolves `path` to its canonical form: absolute, with every `.` and `..` resolved and every
 /// symbolic link followed.
 ///
-/// This is [`std::fs::canonicalize`], run as blocking work. It fails if `path`, or any directory
-/// on the way to it, does not exist.
+/// Runs [`std::fs::canonicalize`] as blocking work.
+///
+/// # Errors
+///
+/// Fails if `path`, or any directory on the way to it, does not exist.
 pub async fn canonicalize<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -128,13 +120,12 @@ where
     unblock(move || std::fs::canonicalize(path)).await
 }
 
-/// Copies the contents and the permissions of the file `src` to `dst`, and tells how many bytes
-/// that was.
+/// Copies the contents and the permissions of the file `src` to `dst`, and returns the number of
+/// bytes copied.
 ///
-/// This is [`std::fs::copy`], run as blocking work. A `dst` that exists is overwritten, and one
-/// that is the same file as `src` is likely to be truncated by that. To copy between two open
-/// [`File`]s instead, use an async copy that reads and writes through them, such as
-/// `futures::io::copy`.
+/// Runs [`std::fs::copy`] as blocking work. An existing `dst` is overwritten. If `dst` is the same
+/// file as `src`, it is likely to be truncated. To copy between two open [`File`]s, use an async
+/// copy that reads and writes through them, such as `futures::io::copy`.
 pub async fn copy<P, Q>(src: P, dst: Q) -> io::Result<u64>
 where
     P: AsRef<Path>,
@@ -147,9 +138,12 @@ where
 
 /// Creates a new, empty directory at `path`.
 ///
-/// This is [`std::fs::create_dir`], run as blocking work. It fails if the parent of `path` does not
-/// exist, and if `path` does: [`create_dir_all`] makes the missing parents as well, and does not
-/// mind a directory that is there already.
+/// Runs [`std::fs::create_dir`] as blocking work.
+///
+/// # Errors
+///
+/// Fails if the parent of `path` does not exist, or if `path` already exists. To create missing
+/// parents and accept an existing directory, use [`create_dir_all`].
 pub async fn create_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -158,10 +152,10 @@ where
     unblock(move || std::fs::create_dir(path)).await
 }
 
-/// Creates a directory at `path`, and every one of its parents that does not exist.
+/// Creates a directory at `path`, along with any parents that do not exist.
 ///
-/// This is [`std::fs::create_dir_all`], run as blocking work. It does not fail for a directory
-/// that is there already, nor for one that another thread or process makes in the meantime.
+/// Runs [`std::fs::create_dir_all`] as blocking work. It is not an error if the directory already
+/// exists, or if another thread or process creates it in the meantime.
 pub async fn create_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -172,8 +166,8 @@ where
 
 /// Makes `dst` another name for the file `src`.
 ///
-/// This is [`std::fs::hard_link`], run as blocking work. The two names are the same file, and most
-/// operating systems allow that only for two names on the same filesystem.
+/// Runs [`std::fs::hard_link`] as blocking work. Both names refer to the same file. Most operating
+/// systems allow this only for two names on the same filesystem.
 pub async fn hard_link<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -184,11 +178,10 @@ where
     unblock(move || std::fs::hard_link(src, dst)).await
 }
 
-/// Reads the metadata of the file or directory at `path`, following symbolic links to what they
-/// point at.
+/// Reads the metadata of the file or directory at `path`, following symbolic links.
 ///
-/// This is [`std::fs::metadata`], run as blocking work. [`symlink_metadata`] reads the link itself
-/// instead.
+/// Runs [`std::fs::metadata`] as blocking work. To read the metadata of a link itself, use
+/// [`symlink_metadata`].
 pub async fn metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -197,12 +190,12 @@ where
     unblock(move || std::fs::metadata(path)).await
 }
 
-/// Reads the whole of the file at `path` into a vector of bytes.
+/// Reads the whole file at `path` into a vector of bytes.
 ///
-/// This is [`std::fs::read`], run as blocking work: it sizes the vector by the length of the file
-/// where it can, and does all of its reading in one piece of work. That makes it quicker than
-/// opening a [`File`] and reading that, which has the pool do a piece of work for every part of the
-/// file it reads. [`read_to_string`] reads text instead.
+/// Runs [`std::fs::read`] as blocking work. It sizes the vector by the length of the file where it
+/// can, and does all of its reading in one piece of work. That makes it faster than opening a
+/// [`File`] and reading that, which takes one piece of work per chunk read. To read text, use
+/// [`read_to_string`].
 pub async fn read<P>(path: P) -> io::Result<Vec<u8>>
 where
     P: AsRef<Path>,
@@ -211,11 +204,15 @@ where
     unblock(move || std::fs::read(path)).await
 }
 
-/// Opens the directory at `path` for listing, and hands back the stream of its entries.
+/// Opens the directory at `path` and returns a stream of its entries.
 ///
-/// This is [`std::fs::read_dir`], run as blocking work, which fails if `path` is not a directory
-/// that can be read. The entries then come out of [`ReadDir`] in no particular order, and it is
-/// that stream that can fail while it is read.
+/// Runs [`std::fs::read_dir`] as blocking work. The entries come out of [`ReadDir`] in no
+/// particular order.
+///
+/// # Errors
+///
+/// Fails if `path` is not a directory that can be read. Reading the [`ReadDir`] stream can fail
+/// too.
 ///
 /// # Example
 ///
@@ -254,10 +251,10 @@ where
     Ok(ReadDir::new(dir))
 }
 
-/// Reads where the symbolic link at `path` points to.
+/// Reads the target of the symbolic link at `path`.
 ///
-/// This is [`std::fs::read_link`], run as blocking work. The path it finds is the one the link
-/// holds, which may be relative to the directory of the link, and may lead nowhere.
+/// Runs [`std::fs::read_link`] as blocking work. The path it returns is the one stored in the link.
+/// It can be relative to the directory of the link, and can lead nowhere.
 pub async fn read_link<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -266,11 +263,13 @@ where
     unblock(move || std::fs::read_link(path)).await
 }
 
-/// Reads the whole of the file at `path` into a string.
+/// Reads the whole file at `path` into a string.
 ///
-/// This is [`std::fs::read_to_string`], run as blocking work, which fails with
-/// [`InvalidData`](io::ErrorKind::InvalidData) for a file that is not UTF-8. [`read`] reads bytes
-/// instead.
+/// Runs [`std::fs::read_to_string`] as blocking work. To read bytes, use [`read`].
+///
+/// # Errors
+///
+/// Fails with [`InvalidData`](io::ErrorKind::InvalidData) if the file is not valid UTF-8.
 pub async fn read_to_string<P>(path: P) -> io::Result<String>
 where
     P: AsRef<Path>,
@@ -279,10 +278,10 @@ where
     unblock(move || std::fs::read_to_string(path)).await
 }
 
-/// Removes the directory at `path`, which has to be empty.
+/// Removes the directory at `path`, which must be empty.
 ///
-/// This is [`std::fs::remove_dir`], run as blocking work. [`remove_dir_all`] removes a directory
-/// together with what is in it.
+/// Runs [`std::fs::remove_dir`] as blocking work. To remove a directory together with its contents,
+/// use [`remove_dir_all`].
 pub async fn remove_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -293,9 +292,9 @@ where
 
 /// Removes the directory at `path` and everything in it.
 ///
-/// This is [`std::fs::remove_dir_all`], run as blocking work. A directory with a lot in it takes a
-/// while to remove, which is what the pool is for, and an error part of the way leaves what was
-/// not removed yet where it is.
+/// Runs [`std::fs::remove_dir_all`] as blocking work. A large directory takes a while to remove,
+/// and the polling thread stays free meanwhile. If the removal fails part of the way, what was not
+/// yet removed stays where it is.
 pub async fn remove_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -306,8 +305,8 @@ where
 
 /// Removes the file at `path`.
 ///
-/// This is [`std::fs::remove_file`], run as blocking work. It removes a name, which for a symbolic
-/// link is the link and not what it points at.
+/// Runs [`std::fs::remove_file`] as blocking work. It removes a name. For a symbolic link, that is
+/// the link and not its target.
 pub async fn remove_file<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -316,11 +315,14 @@ where
     unblock(move || std::fs::remove_file(path)).await
 }
 
-/// Renames the file or directory at `src` to `dst`, replacing what is at `dst` where the platform
+/// Renames the file or directory at `src` to `dst`, replacing what is at `dst` if the platform
 /// allows it.
 ///
-/// This is [`std::fs::rename`], run as blocking work. It fails where `src` and `dst` are on
-/// different filesystems.
+/// Runs [`std::fs::rename`] as blocking work.
+///
+/// # Errors
+///
+/// Fails, for example, if `src` and `dst` are on different filesystems.
 pub async fn rename<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -333,8 +335,8 @@ where
 
 /// Changes the permissions of the file or directory at `path` to `perm`.
 ///
-/// This is [`std::fs::set_permissions`], run as blocking work. The permissions to change to are
-/// usually those from [`metadata`], changed as wanted.
+/// Runs [`std::fs::set_permissions`] as blocking work. To change only some of the permissions,
+/// start from the ones that [`metadata`] reads.
 pub async fn set_permissions<P>(path: P, perm: Permissions) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -345,8 +347,8 @@ where
 
 /// Reads the metadata of the file, directory or symbolic link at `path`, without following a link.
 ///
-/// This is [`std::fs::symlink_metadata`], run as blocking work. [`metadata`] reads what a link
-/// points at instead.
+/// Runs [`std::fs::symlink_metadata`] as blocking work. To read the metadata of what a link points
+/// at, use [`metadata`].
 pub async fn symlink_metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -355,11 +357,11 @@ where
     unblock(move || std::fs::symlink_metadata(path)).await
 }
 
-/// Makes `contents` the new contents of the file at `path`, creating the file if it is not there.
+/// Writes `contents` to the file at `path`, creating the file if it does not exist and replacing
+/// its contents if it does.
 ///
-/// This is [`std::fs::write`], run as blocking work, which replaces what the file held. The bytes
-/// are copied before the function first waits, as the work runs on another thread, and a slice of
-/// the caller's cannot go there.
+/// Runs [`std::fs::write`] as blocking work. The bytes are copied when the future is first polled,
+/// because the work runs on another thread and cannot borrow them from the caller.
 pub async fn write<P, C>(path: P, contents: C) -> io::Result<()>
 where
     P: AsRef<Path>,
