@@ -23,30 +23,26 @@ use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A TCP socket server, listening for connections.
 ///
-/// A listener is bound to a socket address with [`TcpListener::bind`], and hands out the
-/// connections made to that address, each as a [`TcpStream`], through
-/// [`accept`](TcpListener::accept), or as a stream of them through
-/// [`incoming`](TcpListener::incoming). It is the async counterpart of [`std::net::TcpListener`]:
-/// waiting for a connection leaves the thread to the other tasks instead of blocking it.
+/// Create a listener with [`TcpListener::bind`]. Then call [`accept`](TcpListener::accept) to take
+/// one connection, or [`incoming`](TcpListener::incoming) for a stream of connections. Each
+/// connection is a [`TcpStream`]. The listener is the async counterpart of
+/// [`std::net::TcpListener`]: waiting for a connection lets other tasks run instead of blocking the
+/// thread.
 ///
-/// The listener runs on the runtime given to the constructor that made it, whose reactor watches
-/// it from then on, and so do the streams it accepts. Its operations make progress while some
-/// thread is inside [`Runtime::block_on`] on that runtime, or, on a runtime from
-/// `SharedRuntime::current`, while the helper thread runs it. The listener's type carries the
-/// flavour of that runtime: one built on a [`LocalRuntime`](crate::LocalRuntime) is a
-/// `TcpListener<Local>`, [`Local`] being the default, and stays on the thread it was made on; one
-/// built on a [`SharedRuntime`](crate::SharedRuntime) is a `TcpListener<Shared>`, which may be
-/// sent to, and used from, any thread.
+/// The listener runs on the runtime passed to its constructor, and so do the streams it accepts.
+/// Its type carries that runtime's flavour, as the [module documentation](super) explains: a
+/// `TcpListener<Local>` (the default) stays on the thread that made it, and a `TcpListener<Shared>`
+/// can be sent to and used from any thread.
 ///
-/// Any number of tasks may wait for a connection through [`accept`](TcpListener::accept) at once,
-/// each through a reference to the listener, and each connection goes to one of them. Waiting for
-/// the next item of an [`Incoming`] stream is not like that: at most one task at a time may do it,
-/// counting every stream of the listener, and the tasks in `accept` do not count against it.
+/// Any number of tasks can wait in [`accept`](TcpListener::accept) at once through a reference to
+/// the listener, and each connection goes to one of them. Only one task at a time can wait for the
+/// next item of an [`Incoming`] stream, counting all the streams of the listener. Tasks waiting in
+/// `accept` do not count.
 ///
 /// # Example
 ///
-/// A listener that accepts a connection and reads a greeting from it, and a client that makes the
-/// connection and sends the greeting:
+/// A listener accepts a connection and reads a greeting from it. A client makes the connection and
+/// sends the greeting.
 ///
 /// ```
 /// use std::net::Ipv4Addr;
@@ -58,7 +54,7 @@ use crate::{AsyncIo, Local, Mode, Runtime};
 /// };
 ///
 /// let runtime = LocalRuntime::new()?;
-/// // Port `0` has the system pick a free port, which the listener then reports.
+/// // Port `0` lets the system pick a free port.
 /// let listener = TcpListener::bind(&runtime, (Ipv4Addr::LOCALHOST, 0))?;
 /// let address = listener.local_addr()?;
 ///
@@ -87,18 +83,19 @@ impl<M> TcpListener<M>
 where
     M: Mode,
 {
-    /// A listener bound to `addr`, on `runtime`.
+    /// Creates a listener bound to `addr`, on `runtime`.
     ///
     /// `addr` is a socket address: a [`SocketAddr`], or anything that converts into one, such as a
-    /// pair of an [`Ipv4Addr`](std::net::Ipv4Addr) and a port. It is never a host name. Looking a
-    /// name up, through std's [`ToSocketAddrs`](std::net::ToSocketAddrs), blocks the thread for as
-    /// long as the resolver takes, which a task must not do to the thread it shares with the
-    /// others, so a caller with a name looks it up first, on a thread of its own, and binds to the
-    /// address it finds. Binding to port `0` has the system pick a free port, which
-    /// [`local_addr`](TcpListener::local_addr) then tells.
+    /// pair of an [`Ipv4Addr`](std::net::Ipv4Addr) and a port. It is never a host name; the
+    /// [module documentation](super) explains what to do instead. Binding to port `0` lets the
+    /// system pick a free port, which [`local_addr`](TcpListener::local_addr) returns.
     ///
-    /// The listener is bound and listening once this returns. What can fail is that, or what
-    /// [`from_std`](TcpListener::from_std) can fail at.
+    /// The listener is bound and listening when this returns.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be bound to `addr`, or for the reasons
+    /// [`from_std`](TcpListener::from_std) fails.
     pub fn bind<A>(runtime: &Runtime<M>, addr: A) -> io::Result<Self>
     where
         A: Into<SocketAddr>,
@@ -106,16 +103,17 @@ where
         Self::from_std(runtime, std::net::TcpListener::bind(addr.into())?)
     }
 
-    /// A listener on `runtime` that accepts the connections `listener` would.
+    /// Creates a listener on `runtime` from a std listener.
     ///
-    /// `listener` is switched to non-blocking mode, which every listener of this type is in. On
-    /// Unix the mode belongs to the open socket rather than to a handle on it, so a duplicate of
-    /// `listener` made with [`try_clone`](std::net::TcpListener::try_clone) is switched with it,
-    /// and an `accept` on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited.
+    /// `listener` is switched to non-blocking mode, as every listener of this type is. On unix, the
+    /// mode belongs to the open socket, so a duplicate made with
+    /// [`try_clone`](std::net::TcpListener::try_clone) is switched too. An `accept` on that
+    /// duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, and the runtime taking the socket under
-    /// its watch, which on Windows it does for a limited number of sockets: see the
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, or if the runtime cannot start watching the
+    /// socket. On Windows a runtime watches a limited number of sockets; see the
     /// [module documentation](super).
     pub fn from_std(runtime: &Runtime<M>, listener: std::net::TcpListener) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
@@ -127,55 +125,43 @@ where
 
     /// Waits for a connection to this listener, and accepts it.
     ///
-    /// Resolves to the stream of the connection, which runs on the listener's runtime and is in
-    /// non-blocking mode, and the address of the peer that made the connection.
+    /// Returns the stream of the connection and the address of the peer that made it. The stream
+    /// runs on the listener's runtime and is in non-blocking mode.
     ///
-    /// Dropping the future before it completes gives up the wait. No connection is lost with it:
-    /// one that comes in meanwhile stays queued for the next call.
+    /// # Errors
     ///
-    /// An accept that fails resolves to the error. Where the error leaves the connection queued,
-    /// as the system running out of file descriptors (`EMFILE`) does on Linux and the BSDs, the
-    /// next call fails again at once, and so does each one after it for as long as the connection
-    /// stays queued: a loop that goes on accepting straight after an error spins the thread. On
-    /// Apple's platforms an accept that finds no descriptor left closes the connection it took off
-    /// the queue instead, so the error does not repeat, but the connection is lost. A caller that
-    /// goes on after an error backs off first, with [`Runtime::sleep`], say.
+    /// Returns the error of the accept.
     ///
-    /// On Windows, where a runtime watches a limited number of sockets (see the
-    /// [module documentation](super)), an accept that would take it past the limit takes the
-    /// connection off the queue and then fails to register it: the connection is closed, which its
-    /// peer sees as its end, and the accept fails.
+    /// Some errors leave the connection queued, for example running out of file descriptors
+    /// (`EMFILE`) on Linux and the BSDs. The next call then fails again at once, and so on until
+    /// the connection leaves the queue, so a loop that keeps accepting after an error spins the
+    /// thread. Back off after an error, for example with [`Runtime::sleep`]. On Apple's platforms
+    /// an accept that finds no descriptor left closes the connection instead: the error does not
+    /// repeat, but the connection is lost.
+    ///
+    /// On Windows a runtime watches a limited number of sockets (see the
+    /// [module documentation](super)). An accept that would exceed the limit fails, and the
+    /// connection it took off the queue is closed. Its peer sees the connection end.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait. No connection is lost: a
+    /// connection that arrives meanwhile stays queued for the next call.
     pub async fn accept(&self) -> io::Result<(TcpStream<M>, SocketAddr)> {
         let (stream, address) = self.io.read_with(|listener| listener.accept()).await?;
 
         self.accepted(stream, address)
     }
 
-    /// A stream of the connections made to this listener.
+    /// Returns a stream of the connections made to this listener.
     ///
     /// Each item is the [`TcpStream`] of a connection, accepted as [`accept`](TcpListener::accept)
-    /// accepts it, or the error of an accept that failed. The stream never ends, and an error is
-    /// not its end either. Nor does an error leave it pending until the next connection comes in:
-    /// polled again, it accepts again. Where the error left the connection queued, as the system
-    /// running out of file descriptors (`EMFILE`) does on Linux and the BSDs, the next item is
-    /// that error again at once, and so is each one after it for as long as the connection stays
-    /// queued, so a loop that goes on taking items straight after an error spins the thread. On
-    /// Apple's platforms an accept that finds no descriptor left closes the connection it took off
-    /// the queue instead, so the error does not repeat, but the connection is lost. A caller that
-    /// goes on after an error backs off first, with [`Runtime::sleep`], say.
-    ///
-    /// On Windows, where a runtime watches a limited number of sockets (see the
-    /// [module documentation](super)), an item that would take it past the limit is the error of
-    /// an accept that took the connection off the queue and closed it, as
-    /// [`accept`](TcpListener::accept) says.
-    ///
-    /// At most one task at a time may wait for the next item, counting every stream this listener
-    /// hands out, and a task waiting in [`accept`](TcpListener::accept) does not count against it,
-    /// as [the stream's documentation](Incoming) says.
+    /// accepts it, or the error of a failed accept. See [`Incoming`] for how errors and waiting
+    /// tasks behave.
     ///
     /// # Example
     ///
-    /// The first two connections made to a listener, in the order they were made:
+    /// The stream yields the first two connections made to a listener, in the order they were made.
     ///
     /// ```
     /// use std::net::Ipv4Addr;
@@ -208,23 +194,24 @@ where
         Incoming { listener: self }
     }
 
-    /// The local socket address this listener is bound to.
+    /// The socket address this listener is bound to.
     ///
-    /// After binding to port `0`, this is how to find the port the system picked.
+    /// After binding to port `0`, this returns the port the system picked.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
 
-    /// The value of the `IP_TTL` option of this listener's socket: the time-to-live field of the
-    /// IP packets sent from it.
+    /// The `IP_TTL` option of this listener's socket.
     ///
-    /// See [`set_ttl`](TcpListener::set_ttl).
+    /// This is the time-to-live field of the IP packets sent from the socket. See
+    /// [`set_ttl`](TcpListener::set_ttl).
     pub fn ttl(&self) -> io::Result<u32> {
         self.io.get_ref().ttl()
     }
 
-    /// Sets the value of the `IP_TTL` option of this listener's socket: the time-to-live field of
-    /// the IP packets sent from it.
+    /// Sets the `IP_TTL` option of this listener's socket.
+    ///
+    /// This is the time-to-live field of the IP packets sent from the socket.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
     }
@@ -281,45 +268,40 @@ where
 
 /// A TCP connection, to read from and write to.
 ///
-/// A stream is made by connecting to a socket address with [`TcpStream::connect`], or by a
-/// [`TcpListener`] accepting a connection. It is the async counterpart of [`std::net::TcpStream`]:
-/// a read or a write that has to wait leaves the thread to the other tasks instead of blocking it.
+/// Create a stream with [`TcpStream::connect`], or get one from [`TcpListener::accept`]. The stream
+/// is the async counterpart of [`std::net::TcpStream`]: a read or write that has to wait lets other
+/// tasks run instead of blocking the thread.
 ///
 /// The stream implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
-/// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
-/// `&TcpStream`, which lets a reader and a writer share one stream, as std's `Read` and `Write` do
-/// for a `&std::net::TcpStream`. A write sends as much as the kernel takes at once, which may be
-/// less than the whole buffer, and nothing is held back, so flushing has nothing to do.
+/// extension traits of [`futures`] work on it. So does `&TcpStream`, which lets a reader and a
+/// writer share one stream, as std's `Read` and `Write` do for a `&std::net::TcpStream`. A write
+/// sends as much as the kernel takes at once, which may be less than the whole buffer. Nothing is
+/// buffered, so flushing does nothing.
 ///
-/// Closing the stream, as the `close` of `AsyncWriteExt` does, shuts down the write half of the
-/// socket, as [`shutdown`](TcpStream::shutdown) with [`Shutdown::Write`] does: the peer reads the
-/// end of the stream once it has read what was sent, while the read half stays open. It is the
-/// socket that is shut down, so closing the stream through one `&TcpStream` ends it for every
-/// handle on it. Closing a stream that is closed already is fine, on every platform: the write
-/// half is not shut down a second time, so the read half stays open. That goes for a stream whose
-/// write half was shut down with `shutdown` before, too.
+/// Closing the stream (for example with the `close` method of `AsyncWriteExt`) shuts down the write
+/// half of the socket, like [`shutdown`](TcpStream::shutdown) with [`Shutdown::Write`]. The peer
+/// reads the end of the stream once it has read everything sent. The read half stays open. It is
+/// the socket that is shut down, so closing the stream through one `&TcpStream` ends it for every
+/// handle on it. Closing a stream twice is fine on every platform: the second close does not shut
+/// down the write half again, so the read half stays open. The same holds if the write half was
+/// already shut down with `shutdown`.
 ///
-/// The stream runs on the runtime given to the constructor that made it, whose reactor watches it
-/// from then on; a stream a [`TcpListener`] accepted is on the listener's runtime. Its operations
-/// make progress while some thread is inside [`Runtime::block_on`] on that runtime, or, on a
-/// runtime from `SharedRuntime::current`, while the helper thread runs it. The stream's type
-/// carries the flavour of that runtime: one built on a [`LocalRuntime`](crate::LocalRuntime) is a
-/// `TcpStream<Local>`, [`Local`] being the default, and stays on the thread it was made on; one
-/// built on a [`SharedRuntime`](crate::SharedRuntime) is a `TcpStream<Shared>`, which may be sent
-/// to, and used from, any thread.
+/// The stream runs on the runtime passed to its constructor. A stream accepted by a [`TcpListener`]
+/// runs on the listener's runtime. The stream's type carries that runtime's flavour, as the
+/// [module documentation](super) explains: a `TcpStream<Local>` (the default) stays on the thread
+/// that made it, and a `TcpStream<Shared>` can be sent to and used from any thread.
 ///
-/// At most one task at a time may wait to read from a stream through its `AsyncRead`
-/// implementation, and at most one to write to it through its `AsyncWrite` one, counting every
-/// reference to the stream: where a second task waits in the same direction, the one that waited
-/// first may never be woken. Tasks that read, or write, together take turns, behind a lock of their
-/// own. [`peek`](TcpStream::peek) is not subject to that: any number of tasks may wait in it at
-/// once, and one that does never takes the place of a task waiting to read, nor the other way
-/// round.
+/// Only one task at a time can wait to read through the `AsyncRead` implementation, and only one to
+/// write through `AsyncWrite`, counting all references to the stream. If a second task waits in the
+/// same direction, it replaces the first, which is then never woken. Tasks that read, or write,
+/// together must take turns, for example behind a lock. [`peek`](TcpStream::peek) has no such
+/// limit: any number of tasks can wait in it at once, and it never replaces a task waiting to read,
+/// nor the other way round.
 ///
 /// # Example
 ///
-/// A client that sends a message and closes its end of the stream, a server that reads the message
-/// up to the end of the stream, and the answer that still gets from the server to the client:
+/// A client sends a message and closes its end of the stream. A server reads the message up to the
+/// end of the stream. The server can still send an answer to the client.
 ///
 /// ```
 /// use std::net::Ipv4Addr;
@@ -338,15 +320,15 @@ where
 ///     let (mut server, _) = listener.accept().await?;
 ///
 ///     client.write_all(b"ping").await?;
-///     // Closing shuts the client's write half down: the server reads the end of the stream after
-///     // the bytes the client sent.
+///     // Closing shuts down the client's write half. The server reads the end of the stream
+///     // after the bytes the client sent.
 ///     client.close().await?;
 ///
 ///     let mut message = Vec::new();
 ///     server.read_to_end(&mut message).await?;
 ///     assert_eq!(message, b"ping");
 ///
-///     // The other direction is open still.
+///     // The other direction is still open.
 ///     server.write_all(b"pong").await?;
 ///     let mut answer = [0; 4];
 ///     client.read_exact(&mut answer).await?;
@@ -391,21 +373,24 @@ impl<M> TcpStream<M>
 where
     M: Mode,
 {
-    /// A stream connected to `addr`, on `runtime`.
+    /// Creates a stream connected to `addr`, on `runtime`.
     ///
     /// `addr` is a socket address: a [`SocketAddr`], or anything that converts into one, such as a
-    /// pair of an [`Ipv4Addr`](std::net::Ipv4Addr) and a port. It is never a host name. Looking a
-    /// name up, through std's [`ToSocketAddrs`](std::net::ToSocketAddrs), blocks the thread for as
-    /// long as the resolver takes, which a task must not do to the thread it shares with the
-    /// others, so a caller with a name looks it up first, on a thread of its own, and connects to
-    /// the addresses it finds, one after the other, until one of them takes the connection.
+    /// pair of an [`Ipv4Addr`](std::net::Ipv4Addr) and a port. It is never a host name; the
+    /// [module documentation](super) explains what to do instead.
     ///
-    /// The connection does not block the thread either: the future waits for the runtime to report
-    /// that the connection is made, or that it failed, in which case it resolves to the error.
-    /// Dropping the future before it completes gives up the attempt.
+    /// The connection does not block the thread. The future waits until the runtime reports that
+    /// the connection is made or has failed.
     ///
-    /// On Windows, where a runtime watches a limited number of sockets (see the
-    /// [module documentation](super)), a connect that would take it past the limit fails.
+    /// # Errors
+    ///
+    /// Returns the error of the connection attempt. On Windows a runtime watches a limited number
+    /// of sockets (see the [module documentation](super)), and a connect that would exceed the
+    /// limit fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the connection attempt.
     pub async fn connect<A>(runtime: &Runtime<M>, addr: A) -> io::Result<Self>
     where
         A: Into<SocketAddr>,
@@ -424,18 +409,21 @@ where
         })
     }
 
-    /// A stream on `runtime` that reads and writes the connection `stream` does.
+    /// Creates a stream on `runtime` from a std stream.
     ///
-    /// `stream` is switched to non-blocking mode, which every stream of this type is in. On Unix
-    /// the mode belongs to the open socket rather than to a handle on it, so a duplicate of
-    /// `stream` made with [`try_clone`](std::net::TcpStream::try_clone) is switched with it, and a
-    /// read or a write on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited. On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a
-    /// write to a peer that has gone fails rather than raising `SIGPIPE`.
+    /// `stream` is switched to non-blocking mode, as every stream of this type is. On unix, the
+    /// mode belongs to the open socket, so a duplicate made with
+    /// [`try_clone`](std::net::TcpStream::try_clone) is switched too. A read or write on that
+    /// duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, setting that option, and the runtime
-    /// taking the socket under its watch, which on Windows it does for a limited number of
-    /// sockets: see the [module documentation](super).
+    /// On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a write to a peer that has
+    /// gone fails instead of raising `SIGPIPE`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, if setting `SO_NOSIGPIPE` fails (on Apple's
+    /// platforms), or if the runtime cannot start watching the socket. On Windows a runtime watches
+    /// a limited number of sockets; see the [module documentation](super).
     pub fn from_std(runtime: &Runtime<M>, stream: std::net::TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         set_nosigpipe(&stream)?;
@@ -446,46 +434,45 @@ where
         })
     }
 
-    /// The local socket address of the connection: this end of it.
+    /// The socket address of this end of the connection.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
 
-    /// The socket address of the peer the stream is connected to: the other end of the connection.
+    /// The socket address of the peer: the other end of the connection.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().peer_addr()
     }
 
-    /// Stops watching the stream, and hands the socket back as a std stream, still in non-blocking
+    /// Stops watching the stream, and returns the socket as a std stream, still in non-blocking
     /// mode.
     ///
-    /// The runtime lets go of the socket, and the connection is left as it was: the std stream
-    /// reads the bytes that arrived and were not read yet. The socket stays in non-blocking mode,
-    /// as every stream of this type is, so a read or a write on the std stream fails with
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock) where it would have waited, until
-    /// [`set_nonblocking`](std::net::TcpStream::set_nonblocking) switches the mode back. Handing
-    /// the socket to [`from_std`](TcpStream::from_std) takes it up again, on this runtime or on
-    /// another. A stream made that way does not know that the write half of the socket was shut
-    /// down before, as [`shutdown`](TcpStream::shutdown) says.
+    /// The connection is left as it was: the std stream can read the bytes that arrived but were
+    /// not read yet. The socket stays in non-blocking mode, so a read or write on the std stream
+    /// fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting, until
+    /// [`set_nonblocking`](std::net::TcpStream::set_nonblocking) switches the mode back.
     ///
-    /// On a shared runtime this may wait for a moment, while a thread driving the runtime returns
-    /// from a wait that watched the socket.
+    /// A stream created from the socket again with [`from_std`](TcpStream::from_std) does not know
+    /// that its write half was shut down before; see [`shutdown`](TcpStream::shutdown).
+    ///
+    /// On a shared runtime this may wait briefly, until a thread driving the runtime returns from a
+    /// wait that was watching the socket.
     pub fn into_std(self) -> std::net::TcpStream {
         self.io.into_inner()
     }
 
     /// Shuts down the read half, the write half or both halves of the connection, as `how` says.
     ///
-    /// Shutting down the write half makes the peer read the end of the stream, once it has read
-    /// what was sent, which is what closing the stream does. It is the socket that is shut
-    /// down, so it holds for every handle on the stream.
+    /// Shutting down the write half makes the peer read the end of the stream once it has read
+    /// everything sent, as closing the stream does. The socket is shut down, so this affects every
+    /// handle on the stream.
     ///
-    /// Closing the stream after its write half was shut down here, alone or with the read half,
-    /// does nothing more. A second `shutdown` of the write half does reach the system, unlike a
-    /// second close: that is harmless on most platforms, but on FreeBSD and NetBSD it ends the
-    /// read half too, once the peer has acknowledged the first. And a stream made with
-    /// [`from_std`](TcpStream::from_std) from a socket whose write half was shut down through std
-    /// does not know it: closing that stream shuts the write half down again.
+    /// Closing the stream after its write half was shut down here does nothing more. A second
+    /// `shutdown` of the write half does reach the system, unlike a second close. That is harmless
+    /// on most platforms, but on FreeBSD and NetBSD it also ends the read half once the peer has
+    /// acknowledged the first. A stream created with [`from_std`](TcpStream::from_std) from a
+    /// socket whose write half was shut down through std does not know that, so closing it shuts
+    /// the write half down again.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         if matches!(how, Shutdown::Write | Shutdown::Both) {
             // Noted before the system is asked, whatever it answers: see `write_shut`. Nothing
@@ -496,43 +483,43 @@ where
         self.io.get_ref().shutdown(how)
     }
 
-    /// Waits for bytes to arrive, and copies them into `buf` without taking them off the stream.
+    /// Waits for bytes to arrive, and copies them into `buf` without removing them from the stream.
     ///
-    /// Resolves to the number of bytes copied, which is zero only where `buf` is empty or the peer
-    /// has closed its end and nothing is left to read. The next read, or `peek`, finds the same
-    /// bytes again.
+    /// Returns the number of bytes copied. It is zero only if `buf` is empty or the peer has closed
+    /// its end and nothing is left to read. The next read or `peek` returns the same bytes again.
     ///
-    /// Any number of tasks may wait to peek at once, alongside the one that waits to read, as [the
-    /// stream's documentation](TcpStream) says.
+    /// Any number of tasks can wait in `peek` at once, alongside the one task that waits to read;
+    /// see [the stream's documentation](TcpStream).
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|stream| stream.peek(buf)).await
     }
 
-    /// The value of the `TCP_NODELAY` option of this stream's socket.
+    /// The `TCP_NODELAY` option of this stream's socket.
     ///
     /// See [`set_nodelay`](TcpStream::set_nodelay).
     pub fn nodelay(&self) -> io::Result<bool> {
         self.io.get_ref().nodelay()
     }
 
-    /// Sets the value of the `TCP_NODELAY` option of this stream's socket.
+    /// Sets the `TCP_NODELAY` option of this stream's socket.
     ///
-    /// With the option set, a write is sent as soon as it is made, rather than held back so that it
-    /// can be sent together with the writes that follow it (Nagle's algorithm).
+    /// With the option set, a write is sent as soon as it is made, instead of being held back to be
+    /// sent together with later writes (Nagle's algorithm).
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.io.get_ref().set_nodelay(nodelay)
     }
 
-    /// The value of the `IP_TTL` option of this stream's socket: the time-to-live field of the IP
-    /// packets sent from it.
+    /// The `IP_TTL` option of this stream's socket.
     ///
-    /// See [`set_ttl`](TcpStream::set_ttl).
+    /// This is the time-to-live field of the IP packets sent from the socket. See
+    /// [`set_ttl`](TcpStream::set_ttl).
     pub fn ttl(&self) -> io::Result<u32> {
         self.io.get_ref().ttl()
     }
 
-    /// Sets the value of the `IP_TTL` option of this stream's socket: the time-to-live field of the
-    /// IP packets sent from it.
+    /// Sets the `IP_TTL` option of this stream's socket.
+    ///
+    /// This is the time-to-live field of the IP packets sent from the socket.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
     }
@@ -670,27 +657,23 @@ where
     }
 }
 
-/// A stream of the connections a [`TcpListener`] accepts, made by [`TcpListener::incoming`].
+/// A stream of the connections a [`TcpListener`] accepts, created by [`TcpListener::incoming`].
 ///
-/// Each item is the [`TcpStream`] of a connection, on the listener's runtime, or the error of an
-/// accept that failed. The stream never ends: it is pending while no connection waits, and yields
-/// the next one when it comes, for as long as it is polled. It implements the [`Stream`] trait of
-/// [`futures-core`], so the extension traits of [`futures`] drive it.
+/// Each item is the [`TcpStream`] of a connection, on the listener's runtime, or the error of a
+/// failed accept. The stream never ends. It is pending while no connection waits, and yields the
+/// next connection when it arrives. It implements the [`Stream`] trait of [`futures-core`], so the
+/// extension traits of [`futures`] work on it.
 ///
-/// An error is not the end of the stream either, and it does not leave the stream pending until
-/// the next connection comes in: polled again, the stream accepts again. Where the error left the
-/// connection queued, as the system running out of file descriptors (`EMFILE`) does on Linux and
-/// the BSDs, the next item is that error again at once, and so is each one after it for as long
-/// as the connection stays queued, so a loop that goes on taking items straight after an error
-/// spins the thread. On Apple's platforms an accept that finds no descriptor left closes the
-/// connection it took off the queue instead, so the error does not repeat, but the connection is
-/// lost. A caller that goes on after an error backs off first, with [`Runtime::sleep`], say.
+/// An error does not end the stream, and the stream does not stay pending until the next connection
+/// arrives: polled again, it accepts again. The errors are those of
+/// [`accept`](TcpListener::accept), which also describes what they leave behind. Some leave the
+/// connection queued, so the next item is the same error at once. A loop that keeps taking items
+/// after an error then spins the thread, so back off first, for example with [`Runtime::sleep`].
 ///
-/// At most one task at a time may wait for the next item, counting every `Incoming` of the
-/// listener: where a second task waits as well, the one that waited first may never be woken. Tasks
-/// that take items from one listener's streams take turns, behind a lock of their own. Tasks
-/// waiting in [`accept`](TcpListener::accept) do not count against that, nor does it count against
-/// them, as [the listener's documentation](TcpListener) says.
+/// Only one task at a time can wait for the next item, counting every `Incoming` of the listener.
+/// If a second task waits as well, it replaces the first, which is then never woken. Tasks that
+/// take items from one listener's streams must take turns, for example behind a lock. Tasks waiting
+/// in [`accept`](TcpListener::accept) do not count against this limit, nor the other way round.
 ///
 /// [`futures-core`]: https://docs.rs/futures-core
 /// [`futures`]: https://docs.rs/futures

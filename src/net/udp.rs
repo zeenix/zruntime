@@ -11,41 +11,33 @@ use std::{
 
 use crate::{AsyncIo, Local, Mode, Runtime};
 
-/// A UDP socket, to send datagrams from and to receive them on.
+/// A UDP socket, to send datagrams from and receive datagrams on.
 ///
-/// A socket is bound to a socket address with [`UdpSocket::bind`], and receives the datagrams
-/// that are sent to that address. It sends a datagram to an address of the caller's choosing
-/// through [`send_to`](UdpSocket::send_to), and receives one together with the address it came
-/// from through [`recv_from`](UdpSocket::recv_from). Once the socket is
-/// [connected](UdpSocket::connect) to a peer, [`send`](UdpSocket::send) sends to that peer, with
-/// no address to give, and from then on the socket receives only the datagrams that peer sends,
-/// which [`recv`](UdpSocket::recv) hands over without the address they came from. The socket is
-/// the async counterpart of [`std::net::UdpSocket`]: an operation that has to wait leaves the
-/// thread to the other tasks instead of blocking it.
+/// Create a socket with [`UdpSocket::bind`]. It receives the datagrams sent to its address.
+/// [`send_to`](UdpSocket::send_to) sends a datagram to any address, and
+/// [`recv_from`](UdpSocket::recv_from) receives one together with the address it came from.
 ///
-/// A datagram is one message, sent and received whole. The addresses a socket is bound or
-/// connected to, and sends to, are socket addresses, never host names: a name is the caller's to
-/// look up first, as [`UdpSocket::bind`] says.
+/// A socket can be [connected](UdpSocket::connect) to a peer. Then [`send`](UdpSocket::send) sends
+/// to that peer with no address to pass, and the socket receives only the datagrams that peer
+/// sends. [`recv`](UdpSocket::recv) returns a datagram without the address it came from.
 ///
-/// The socket runs on the runtime given to the constructor that made it, whose reactor watches it
-/// from then on. Its operations make progress while some thread is inside [`Runtime::block_on`]
-/// on that runtime, or, on a runtime from `SharedRuntime::current`, while the helper thread runs
-/// it. The socket's type carries the flavour of that runtime: one built on a
-/// [`LocalRuntime`](crate::LocalRuntime) is a `UdpSocket<Local>`, [`Local`] being the default, and
-/// stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime) is a
-/// `UdpSocket<Shared>`, which may be sent to, and used from, any thread.
+/// A datagram is one message, sent and received whole. Addresses are socket addresses, never host
+/// names; see [`UdpSocket::bind`]. The socket is the async counterpart of [`std::net::UdpSocket`]:
+/// an operation that has to wait lets other tasks run instead of blocking the thread.
 ///
-/// Any number of tasks may wait to receive from a socket at once, through
-/// [`recv`](UdpSocket::recv), [`recv_from`](UdpSocket::recv_from), [`peek`](UdpSocket::peek) or
-/// [`peek_from`](UdpSocket::peek_from), and any number to send on it, through
-/// [`send`](UdpSocket::send) or [`send_to`](UdpSocket::send_to), each through a reference to the
-/// socket. Each receive takes a datagram of its own, so tasks that receive together get one each,
-/// while a peek leaves the datagram on the socket for the next receive.
+/// The socket runs on the runtime passed to its constructor. Its type carries that runtime's
+/// flavour, as the [module documentation](super) explains: a `UdpSocket<Local>` (the default) stays
+/// on the thread that made it, and a `UdpSocket<Shared>` can be sent to and used from any thread.
+///
+/// Any number of tasks can wait to receive (with `recv`, `recv_from`, `peek` or `peek_from`) or to
+/// send (with `send` or `send_to`) at once, each through a reference to the socket. Each receive
+/// takes a datagram of its own, so tasks that receive together get one each. A peek leaves the
+/// datagram on the socket for the next receive.
 ///
 /// # Example
 ///
-/// Two sockets, one sending a greeting to the other, which receives it together with the address
-/// it came from:
+/// Two sockets: one sends a greeting to the other, which receives it together with the address it
+/// came from.
 ///
 /// ```
 /// use std::net::Ipv4Addr;
@@ -53,7 +45,7 @@ use crate::{AsyncIo, Local, Mode, Runtime};
 /// use zruntime::{LocalRuntime, net::UdpSocket};
 ///
 /// let runtime = LocalRuntime::new()?;
-/// // Port `0` has the system pick a free port, which the socket then reports.
+/// // Port `0` lets the system pick a free port.
 /// let sender = UdpSocket::bind(&runtime, (Ipv4Addr::LOCALHOST, 0))?;
 /// let receiver = UdpSocket::bind(&runtime, (Ipv4Addr::LOCALHOST, 0))?;
 ///
@@ -80,18 +72,20 @@ impl<M> UdpSocket<M>
 where
     M: Mode,
 {
-    /// A socket bound to `addr`, on `runtime`.
+    /// Creates a socket bound to `addr`, on `runtime`.
     ///
     /// `addr` is a socket address: a [`SocketAddr`], or anything that converts into one, such as a
-    /// pair of an [`Ipv4Addr`] and a port. It is never a host name. Looking a name up, through
-    /// std's [`ToSocketAddrs`](std::net::ToSocketAddrs), blocks the thread for as long as the
-    /// resolver takes, which a task must not do to the thread it shares with the others, so a
-    /// caller with a name looks it up first, on a thread of its own, and binds to the address it
-    /// finds. Binding to port `0` has the system pick a free port, which
-    /// [`local_addr`](UdpSocket::local_addr) then tells.
+    /// pair of an [`Ipv4Addr`] and a port. It is never a host name; the
+    /// [module documentation](super) explains what to do instead. Binding to port `0` lets the
+    /// system pick a free port, which [`local_addr`](UdpSocket::local_addr) returns.
     ///
-    /// The socket is bound once this returns, and takes the datagrams sent to its address from
-    /// then on. What can fail is that, or what [`from_std`](UdpSocket::from_std) can fail at.
+    /// The socket is bound when this returns, and receives the datagrams sent to its address from
+    /// then on.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be bound to `addr`, or for the reasons
+    /// [`from_std`](UdpSocket::from_std) fails.
     pub fn bind<A>(runtime: &Runtime<M>, addr: A) -> io::Result<Self>
     where
         A: Into<SocketAddr>,
@@ -99,16 +93,17 @@ where
         Self::from_std(runtime, std::net::UdpSocket::bind(addr.into())?)
     }
 
-    /// A socket on `runtime` that sends and receives the datagrams `socket` does.
+    /// Creates a socket on `runtime` from a std socket.
     ///
-    /// `socket` is switched to non-blocking mode, which every socket of this type is in. On Unix
-    /// the mode belongs to the open socket rather than to a handle on it, so a duplicate of
-    /// `socket` made with [`try_clone`](std::net::UdpSocket::try_clone) is switched with it, and a
-    /// receive or a send on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited.
+    /// `socket` is switched to non-blocking mode, as every socket of this type is. On unix, the
+    /// mode belongs to the open socket, so a duplicate made with
+    /// [`try_clone`](std::net::UdpSocket::try_clone) is switched too. A receive or send on that
+    /// duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, and the runtime taking the socket under
-    /// its watch, which on Windows it does for a limited number of sockets: see the
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, or if the runtime cannot start watching the
+    /// socket. On Windows a runtime watches a limited number of sockets; see the
     /// [module documentation](super).
     pub fn from_std(runtime: &Runtime<M>, socket: std::net::UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
@@ -118,31 +113,33 @@ where
         })
     }
 
-    /// The local socket address this socket is bound to.
+    /// The socket address this socket is bound to.
     ///
-    /// After binding to port `0`, this is how to find the port the system picked.
+    /// After binding to port `0`, this returns the port the system picked.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
 
     /// The socket address of the peer this socket is connected to.
     ///
-    /// Fails with [`NotConnected`](io::ErrorKind::NotConnected) where the socket is not connected:
-    /// see [`connect`](UdpSocket::connect).
+    /// # Errors
+    ///
+    /// Fails with [`NotConnected`](io::ErrorKind::NotConnected) if the socket is not connected; see
+    /// [`connect`](UdpSocket::connect).
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().peer_addr()
     }
 
-    /// Connects this socket to `addr`, making that address the peer it sends to and, from then on,
-    /// the only one it receives from.
+    /// Connects this socket to `addr`.
     ///
-    /// `addr` is a socket address, never a host name: see [`bind`](UdpSocket::bind). Nothing goes
-    /// over the network and nothing waits, which is why this is not an `async` function. What
-    /// connecting does is fix the address that [`send`](UdpSocket::send) sends to, and make the
-    /// socket take only the datagrams that address sends from then on, and drop the ones any other
+    /// `addr` becomes the address that [`send`](UdpSocket::send) sends to. From then on the socket
+    /// receives only the datagrams that address sends, and drops the datagrams that any other
     /// address sends. A datagram from another address that arrived before the connect is not
-    /// dropped: it is queued still, and a receive takes it. The socket may be connected again, to
-    /// another address.
+    /// dropped: it stays queued, and a receive takes it.
+    ///
+    /// `addr` is a socket address, never a host name; see [`bind`](UdpSocket::bind). Nothing goes
+    /// over the network and nothing waits, so this is not an `async` function. The socket can be
+    /// connected again, to another address.
     pub fn connect<A>(&self, addr: A) -> io::Result<()>
     where
         A: Into<SocketAddr>,
@@ -152,12 +149,11 @@ where
 
     /// Sends `buf` as one datagram to `addr`.
     ///
-    /// `addr` is a socket address, never a host name: see [`bind`](UdpSocket::bind). Resolves to
-    /// the number of bytes sent, which is the length of `buf`: a datagram goes whole or not at all.
-    /// The send waits only where the system has no room for the datagram, until it has made some.
+    /// Returns the number of bytes sent. This is the length of `buf`: a datagram is sent whole or
+    /// not at all. The send waits only if the system has no room for the datagram, until there is
+    /// room.
     ///
-    /// Any number of tasks may wait to send at once, through this or [`send`](UdpSocket::send), as
-    /// [the socket's documentation](UdpSocket) says.
+    /// `addr` is a socket address, never a host name; see [`bind`](UdpSocket::bind).
     pub async fn send_to<A>(&self, buf: &[u8], addr: A) -> io::Result<usize>
     where
         A: Into<SocketAddr>,
@@ -171,163 +167,147 @@ where
 
     /// Waits for a datagram, and copies it into `buf`.
     ///
-    /// Resolves to the number of bytes copied and the address the datagram came from. Where the
-    /// datagram is too long for `buf`, the bytes that do not fit may be discarded. On Windows the
-    /// receive fails instead, with the error Winsock reports for that (`WSAEMSGSIZE`), and the
-    /// whole datagram is lost.
+    /// Returns the number of bytes copied and the address the datagram came from. If the datagram
+    /// is longer than `buf`, the bytes that do not fit may be discarded. On Windows the receive
+    /// fails instead, with the error Winsock reports for this (`WSAEMSGSIZE`), and the whole
+    /// datagram is lost.
     ///
-    /// Dropping the future before it completes gives up the wait. No datagram is lost with it: one
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait. No datagram is lost: a datagram
     /// that arrives meanwhile stays queued for the next receive.
-    ///
-    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
-    /// this or [`recv`](UdpSocket::recv), as [the socket's documentation](UdpSocket) says.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.recv_from(buf)).await
     }
 
-    /// Waits for a datagram, and copies it into `buf` without taking it off the socket.
+    /// Waits for a datagram, and copies it into `buf` without removing it from the socket.
     ///
-    /// Resolves to the number of bytes copied and the address the datagram came from. The next
-    /// receive, or `peek_from`, finds the same datagram again. Where the datagram is too long for
-    /// `buf`, only as much of it as fits is copied. On Windows the peek fails instead, with the
-    /// error Winsock reports for that (`WSAEMSGSIZE`), though the datagram stays queued.
-    ///
-    /// Any number of tasks may wait to peek at once, through this or [`peek`](UdpSocket::peek), as
-    /// [the socket's documentation](UdpSocket) says.
+    /// Returns the number of bytes copied and the address the datagram came from. The next receive
+    /// or `peek_from` returns the same datagram again. If the datagram is longer than `buf`, only
+    /// as much of it as fits is copied. On Windows the peek fails instead, with the error Winsock
+    /// reports for this (`WSAEMSGSIZE`), though the datagram stays queued.
     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.peek_from(buf)).await
     }
 
     /// Sends `buf` as one datagram to the peer the socket is connected to.
     ///
-    /// Resolves to the number of bytes sent, which is the length of `buf`: a datagram goes whole
-    /// or not at all. Fails where the socket is not connected: see
-    /// [`connect`](UdpSocket::connect). The send waits only where the system has no room for the
-    /// datagram, until it has made some.
+    /// Returns the number of bytes sent. This is the length of `buf`: a datagram is sent whole or
+    /// not at all. The send waits only if the system has no room for the datagram, until there is
+    /// room.
     ///
-    /// Any number of tasks may wait to send at once, through this or
-    /// [`send_to`](UdpSocket::send_to), as [the socket's documentation](UdpSocket) says.
+    /// # Errors
+    ///
+    /// Fails if the socket is not connected; see [`connect`](UdpSocket::connect).
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.io.write_with(|socket| socket.send(buf)).await
     }
 
-    /// Waits for a datagram, and copies it into `buf`.
+    /// Waits for a datagram, and copies it into `buf`, without the address it came from.
     ///
-    /// Resolves to the number of bytes copied. This is [`recv_from`](UdpSocket::recv_from) without
-    /// the address the datagram came from, which suits a socket [connected](UdpSocket::connect) to
-    /// a peer: a datagram that arrives from then on can only have come from there. One that
-    /// arrived before the connect may have come from any address, and is handed over all the same,
-    /// without saying which. Where the datagram is too long for `buf`, the bytes that do not fit
-    /// may be discarded. On Windows the receive fails instead, with the error Winsock reports for
-    /// that (`WSAEMSGSIZE`), and the whole datagram is lost.
+    /// Returns the number of bytes copied. This is [`recv_from`](UdpSocket::recv_from) without the
+    /// sender's address. It suits a socket [connected](UdpSocket::connect) to a peer, because a
+    /// datagram that arrives after the connect can only come from there. A datagram that arrived
+    /// before the connect may have come from any address. It is returned all the same, without its
+    /// address. A datagram longer than `buf` is handled as for [`recv_from`](UdpSocket::recv_from).
     ///
-    /// Dropping the future before it completes gives up the wait, and loses no datagram, as it
-    /// does for [`recv_from`](UdpSocket::recv_from).
+    /// # Cancel safety
     ///
-    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
-    /// this or [`recv_from`](UdpSocket::recv_from), as [the socket's documentation](UdpSocket)
-    /// says.
+    /// As for [`recv_from`](UdpSocket::recv_from): dropping the future gives up the wait and loses
+    /// no datagram.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.recv(buf)).await
     }
 
-    /// Waits for a datagram, and copies it into `buf` without taking it off the socket.
+    /// Waits for a datagram, and copies it into `buf` without removing it from the socket.
     ///
-    /// Resolves to the number of bytes copied. This is [`peek_from`](UdpSocket::peek_from) without
-    /// the address the datagram came from. The next receive, or peek, finds the same datagram
-    /// again. Where the datagram is too long for `buf`, only as much of it as fits is copied. On
-    /// Windows the peek fails instead, with the error Winsock reports for that (`WSAEMSGSIZE`),
-    /// though the datagram stays queued.
-    ///
-    /// Any number of tasks may wait to peek at once, through this or
-    /// [`peek_from`](UdpSocket::peek_from), as [the socket's documentation](UdpSocket) says.
+    /// Returns the number of bytes copied. This is [`peek_from`](UdpSocket::peek_from) without the
+    /// sender's address. The next receive or peek returns the same datagram again. A datagram
+    /// longer than `buf` is handled as for [`peek_from`](UdpSocket::peek_from).
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.peek(buf)).await
     }
 
-    /// The value of the `SO_BROADCAST` option of this socket: whether it may send datagrams to a
-    /// broadcast address.
+    /// Whether this socket may send datagrams to a broadcast address.
     ///
-    /// See [`set_broadcast`](UdpSocket::set_broadcast).
+    /// This is the `SO_BROADCAST` option. See [`set_broadcast`](UdpSocket::set_broadcast).
     pub fn broadcast(&self) -> io::Result<bool> {
         self.io.get_ref().broadcast()
     }
 
-    /// Sets the value of the `SO_BROADCAST` option of this socket: whether it may send datagrams
-    /// to a broadcast address, the address that reaches every host on the local network.
+    /// Sets the `SO_BROADCAST` option of this socket: whether it may send datagrams to a broadcast
+    /// address, the address that reaches every host on the local network.
     pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
         self.io.get_ref().set_broadcast(on)
     }
 
-    /// The value of the `IP_MULTICAST_LOOP` option of this socket: whether the multicast datagrams
-    /// it sends are looped back to the local host. On Windows the option is the receiving
-    /// socket's, not the sending socket's.
+    /// Whether the multicast datagrams this socket sends are looped back to the local host.
     ///
-    /// See [`set_multicast_loop_v4`](UdpSocket::set_multicast_loop_v4).
+    /// This is the `IP_MULTICAST_LOOP` option. On Windows the option belongs to the receiving
+    /// socket, not the sending socket. See
+    /// [`set_multicast_loop_v4`](UdpSocket::set_multicast_loop_v4).
     pub fn multicast_loop_v4(&self) -> io::Result<bool> {
         self.io.get_ref().multicast_loop_v4()
     }
 
-    /// Sets the value of the `IP_MULTICAST_LOOP` option of this socket: whether the multicast
-    /// datagrams it sends are looped back to the local host, where the sockets that joined the
-    /// group, this one included, receive them.
+    /// Sets the `IP_MULTICAST_LOOP` option of this socket: whether the multicast datagrams it sends
+    /// are looped back to the local host, where the sockets that joined the group, this one
+    /// included, receive them.
     ///
-    /// On Windows the option is the receiving socket's instead: Winsock applies it to the receive
-    /// path, so it decides whether this socket receives the multicast datagrams that applications
-    /// on the local host send, where POSIX systems apply it to the sending socket.
+    /// On Windows the option applies to the receive path instead: it decides whether this socket
+    /// receives the multicast datagrams that applications on the local host send. POSIX systems
+    /// apply it to the sending socket.
     ///
-    /// This is for a socket of an IPv4 address; for an IPv6 one, see
+    /// This is for IPv4 sockets. For IPv6 sockets, see
     /// [`set_multicast_loop_v6`](UdpSocket::set_multicast_loop_v6).
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
         self.io.get_ref().set_multicast_loop_v4(on)
     }
 
-    /// The value of the `IP_MULTICAST_TTL` option of this socket: the time-to-live field of the
-    /// multicast IP packets sent from it.
+    /// The `IP_MULTICAST_TTL` option of this socket.
     ///
-    /// See [`set_multicast_ttl_v4`](UdpSocket::set_multicast_ttl_v4).
+    /// This is the time-to-live field of the multicast IP packets sent from the socket. See
+    /// [`set_multicast_ttl_v4`](UdpSocket::set_multicast_ttl_v4).
     pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
         self.io.get_ref().multicast_ttl_v4()
     }
 
-    /// Sets the value of the `IP_MULTICAST_TTL` option of this socket: the time-to-live field of
-    /// the multicast IP packets sent from it, which says how far they may travel. The default,
-    /// `1`, keeps them on the local network.
+    /// Sets the `IP_MULTICAST_TTL` option of this socket.
     ///
-    /// This is for a socket of an IPv4 address.
+    /// This is the time-to-live field of the multicast IP packets sent from the socket. It says how
+    /// far they may travel. The default, `1`, keeps them on the local network.
+    ///
+    /// This is for IPv4 sockets.
     pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_multicast_ttl_v4(ttl)
     }
 
-    /// The value of the `IPV6_MULTICAST_LOOP` option of this socket: whether the multicast
-    /// datagrams it sends are looped back to the local host. On Windows the option is the
-    /// receiving socket's, not the sending socket's.
+    /// Whether the multicast datagrams this socket sends are looped back to the local host.
     ///
-    /// See [`set_multicast_loop_v6`](UdpSocket::set_multicast_loop_v6).
+    /// This is the `IPV6_MULTICAST_LOOP` option. On Windows the option belongs to the receiving
+    /// socket, not the sending socket. See
+    /// [`set_multicast_loop_v6`](UdpSocket::set_multicast_loop_v6).
     pub fn multicast_loop_v6(&self) -> io::Result<bool> {
         self.io.get_ref().multicast_loop_v6()
     }
 
-    /// Sets the value of the `IPV6_MULTICAST_LOOP` option of this socket: whether the multicast
-    /// datagrams it sends are looped back to the local host, where the sockets that joined the
-    /// group, this one included, receive them.
+    /// Sets the `IPV6_MULTICAST_LOOP` option of this socket: whether the multicast datagrams it
+    /// sends are looped back to the local host, where the sockets that joined the group, this one
+    /// included, receive them.
     ///
-    /// On Windows the option is the receiving socket's instead: Winsock applies it to the receive
-    /// path, so it decides whether this socket receives the multicast datagrams that applications
-    /// on the local host send, where POSIX systems apply it to the sending socket.
-    ///
-    /// This is for a socket of an IPv6 address; for an IPv4 one, see
-    /// [`set_multicast_loop_v4`](UdpSocket::set_multicast_loop_v4).
+    /// On Windows the option applies to the receive path instead, as for
+    /// [`set_multicast_loop_v4`](UdpSocket::set_multicast_loop_v4), which is the IPv4 version of
+    /// this.
     pub fn set_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
         self.io.get_ref().set_multicast_loop_v6(on)
     }
 
-    /// Joins the IPv4 multicast group `multiaddr`, which makes the socket receive the datagrams
-    /// sent to that group, as the `IP_ADD_MEMBERSHIP` option does.
+    /// Joins the IPv4 multicast group `multiaddr`.
     ///
-    /// `multiaddr` must be a multicast address. `interface` is the address of the local interface
-    /// to join the group on, or [`Ipv4Addr::UNSPECIFIED`] to let the system choose one. The group
-    /// is left with [`leave_multicast_v4`](UdpSocket::leave_multicast_v4), with the same
+    /// The socket then receives the datagrams sent to that group, as the `IP_ADD_MEMBERSHIP` option
+    /// does. `multiaddr` must be a multicast address. `interface` is the address of the local
+    /// interface to join the group on, or [`Ipv4Addr::UNSPECIFIED`] to let the system choose one.
+    /// Leave the group with [`leave_multicast_v4`](UdpSocket::leave_multicast_v4), passing the same
     /// arguments.
     pub fn join_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.io.get_ref().join_multicast_v4(&multiaddr, &interface)
@@ -335,40 +315,39 @@ where
 
     /// Leaves the IPv4 multicast group `multiaddr`, as the `IP_DROP_MEMBERSHIP` option does.
     ///
-    /// The arguments are those the group was joined with, through
-    /// [`join_multicast_v4`](UdpSocket::join_multicast_v4).
+    /// Pass the arguments that were passed to [`join_multicast_v4`](UdpSocket::join_multicast_v4).
     pub fn leave_multicast_v4(&self, multiaddr: Ipv4Addr, interface: Ipv4Addr) -> io::Result<()> {
         self.io.get_ref().leave_multicast_v4(&multiaddr, &interface)
     }
 
-    /// Joins the IPv6 multicast group `multiaddr`, which makes the socket receive the datagrams
-    /// sent to that group, as the `IPV6_ADD_MEMBERSHIP` option does.
+    /// Joins the IPv6 multicast group `multiaddr`.
     ///
-    /// `multiaddr` must be a multicast address. `interface` is the index of the local interface to
-    /// join the group on, or `0` to let the system choose one. The group is left with
-    /// [`leave_multicast_v6`](UdpSocket::leave_multicast_v6), with the same arguments.
+    /// The socket then receives the datagrams sent to that group, as the `IPV6_ADD_MEMBERSHIP`
+    /// option does. `multiaddr` must be a multicast address. `interface` is the index of the local
+    /// interface to join the group on, or `0` to let the system choose one. Leave the group with
+    /// [`leave_multicast_v6`](UdpSocket::leave_multicast_v6), passing the same arguments.
     pub fn join_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.io.get_ref().join_multicast_v6(multiaddr, interface)
     }
 
     /// Leaves the IPv6 multicast group `multiaddr`, as the `IPV6_DROP_MEMBERSHIP` option does.
     ///
-    /// The arguments are those the group was joined with, through
-    /// [`join_multicast_v6`](UdpSocket::join_multicast_v6).
+    /// Pass the arguments that were passed to [`join_multicast_v6`](UdpSocket::join_multicast_v6).
     pub fn leave_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.io.get_ref().leave_multicast_v6(multiaddr, interface)
     }
 
-    /// The value of the `IP_TTL` option of this socket: the time-to-live field of the IP packets
-    /// sent from it.
+    /// The `IP_TTL` option of this socket.
     ///
-    /// See [`set_ttl`](UdpSocket::set_ttl).
+    /// This is the time-to-live field of the IP packets sent from the socket. See
+    /// [`set_ttl`](UdpSocket::set_ttl).
     pub fn ttl(&self) -> io::Result<u32> {
         self.io.get_ref().ttl()
     }
 
-    /// Sets the value of the `IP_TTL` option of this socket: the time-to-live field of the IP
-    /// packets sent from it.
+    /// Sets the `IP_TTL` option of this socket.
+    ///
+    /// This is the time-to-live field of the IP packets sent from the socket.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
     }

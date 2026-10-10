@@ -1,20 +1,24 @@
-//! Unix-domain sockets, on unix platforms only: [`UnixListener`], [`UnixStream`] and
-//! [`UnixDatagram`], and the [`Incoming`] stream of the connections a listener accepts.
+//! Unix-domain sockets, on unix platforms only.
+//!
+//! This module has [`UnixListener`], [`UnixStream`] and [`UnixDatagram`], and the [`Incoming`]
+//! stream of the connections a listener accepts.
 //!
 //! A unix-domain socket is named by a path in the file system. Binding a listener or a datagram
-//! socket to a path creates a socket file there, and a stream connects to a listener, or a
-//! datagram socket sends to another, by the path it is bound to. Nothing removes the file once the
-//! socket that made it is gone, and binding to a path that has a file already fails with
-//! [`AddrInUse`](std::io::ErrorKind::AddrInUse), so whoever owns a path removes its file when done
-//! with it. The system limits how long a path may be, to about a hundred bytes, and a longer one
-//! fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput). On Linux and Android a socket
-//! can instead be named in the abstract namespace, by a string of bytes that has no file behind it,
-//! which std's `SocketAddrExt` makes and reads: [`UnixStream::connect_addr`] connects to one.
+//! socket to a path creates a socket file there. A stream connects to a listener, and a datagram
+//! socket sends to another, by the path the target is bound to.
 //!
-//! The sockets run on a runtime, as the sockets of the [parent module](super) do, and what its
-//! documentation says of those holds for these: which threads drive a socket's operations, how a
-//! socket's type carries the flavour of its runtime, and how many tasks may wait on one socket at
-//! once.
+//! Nothing removes the socket file when the socket is dropped, so remove it when you are done with
+//! the socket. Binding to a path that already has a file fails with
+//! [`AddrInUse`](std::io::ErrorKind::AddrInUse). The system limits the length of a path to about a
+//! hundred bytes. A longer path fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput).
+//!
+//! On Linux and Android a socket can also be named in the abstract namespace, by a string of bytes
+//! that has no file behind it. std's `SocketAddrExt` creates and reads such names, and
+//! [`UnixStream::connect_addr`] connects to one.
+//!
+//! The sockets run on a runtime like the sockets of the [parent module](super). Its documentation
+//! explains which threads drive a socket's operations, how a socket's type carries its runtime's
+//! flavour, and how many tasks can wait on one socket at once.
 
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
@@ -43,31 +47,27 @@ use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A unix-domain socket server, listening for connections.
 ///
-/// A listener is bound to a path with [`UnixListener::bind`], and hands out the connections made
-/// to that path, each as a [`UnixStream`], through [`accept`](UnixListener::accept), or as a
-/// stream of them through [`incoming`](UnixListener::incoming). It is the async counterpart of
-/// [`std::os::unix::net::UnixListener`]: waiting for a connection leaves the thread to the other
-/// tasks instead of blocking it.
+/// Create a listener with [`UnixListener::bind`]. Then call [`accept`](UnixListener::accept) to
+/// take one connection, or [`incoming`](UnixListener::incoming) for a stream of connections. Each
+/// connection is a [`UnixStream`]. The listener is the async counterpart of
+/// [`std::os::unix::net::UnixListener`]: waiting for a connection lets other tasks run instead of
+/// blocking the thread.
 ///
-/// The listener runs on the runtime given to the constructor that made it, whose reactor watches
-/// it from then on, and so do the streams it accepts. Its operations make progress while some
-/// thread is inside [`Runtime::block_on`] on that runtime, or, on a runtime from
-/// `SharedRuntime::current`, while the helper thread runs it. The listener's type carries the
-/// flavour of that runtime: one built on a [`LocalRuntime`](crate::LocalRuntime) is a
-/// `UnixListener<Local>`, [`Local`] being the default, and stays on the thread it was made on; one
-/// built on a [`SharedRuntime`](crate::SharedRuntime) is a `UnixListener<Shared>`, which may be
-/// sent to, and used from, any thread.
+/// The listener runs on the runtime passed to its constructor, and so do the streams it accepts.
+/// Its type carries that runtime's flavour, as the [module documentation](super) explains: a
+/// `UnixListener<Local>` (the default) stays on the thread that made it, and a
+/// `UnixListener<Shared>` can be sent to and used from any thread.
 ///
-/// Any number of tasks may wait for a connection through [`accept`](UnixListener::accept) at once,
-/// each through a reference to the listener, and each connection goes to one of them. Waiting for
-/// the next item of an [`Incoming`] stream is not like that: at most one task at a time may do it,
-/// counting every stream of the listener, and the tasks in `accept` do not count against it.
+/// Any number of tasks can wait in [`accept`](UnixListener::accept) at once through a reference to
+/// the listener, and each connection goes to one of them. Only one task at a time can wait for the
+/// next item of an [`Incoming`] stream, counting all the streams of the listener. Tasks waiting in
+/// `accept` do not count.
 ///
 /// # Example
 ///
-/// A listener that accepts a connection and reads a greeting from it, and a client that makes the
-/// connection and sends the greeting. The socket file is in a directory of its own, which is
-/// removed at the end:
+/// A listener accepts a connection and reads a greeting from it. A client makes the connection and
+/// sends the greeting. The socket file is in a directory of its own, which the example removes at
+/// the end.
 ///
 /// ```
 /// use futures::{AsyncReadExt, AsyncWriteExt};
@@ -111,17 +111,19 @@ impl<M> UnixListener<M>
 where
     M: Mode,
 {
-    /// A listener bound to `path`, on `runtime`.
+    /// Creates a listener bound to `path`, on `runtime`.
     ///
-    /// Binding creates a socket file at `path`, which must have no file already: where one is
-    /// there, a stale socket file left by an earlier listener included, this fails with
-    /// [`AddrInUse`](io::ErrorKind::AddrInUse), and removing that file first is the caller's to do.
-    /// The file the listener makes stays where it is when the listener is dropped, so whoever binds
-    /// a path removes the file when done with it. A path too long to name a socket, which is about
-    /// a hundred bytes, fails with [`InvalidInput`](io::ErrorKind::InvalidInput).
+    /// Binding creates a socket file at `path`. The listener is bound and listening when this
+    /// returns. Dropping the listener does not remove the file, so remove it when you are done with
+    /// the listener.
     ///
-    /// The listener is bound and listening once this returns. What can fail is that, or what
-    /// [`from_std`](UnixListener::from_std) can fail at.
+    /// # Errors
+    ///
+    /// Fails with [`AddrInUse`](io::ErrorKind::AddrInUse) if `path` already has a file. This
+    /// includes a stale socket file left by an earlier listener, which the caller must remove
+    /// first. Fails with [`InvalidInput`](io::ErrorKind::InvalidInput) if `path` is too long to
+    /// name a socket (about a hundred bytes). Also fails for the reasons
+    /// [`from_std`](UnixListener::from_std) fails.
     pub fn bind<P>(runtime: &Runtime<M>, path: P) -> io::Result<Self>
     where
         P: AsRef<Path>,
@@ -129,18 +131,20 @@ where
         Self::from_std(runtime, std::os::unix::net::UnixListener::bind(path)?)
     }
 
-    /// A listener on `runtime` that accepts the connections `listener` would.
+    /// Creates a listener on `runtime` from a std listener.
     ///
-    /// `listener` is switched to non-blocking mode, which every listener of this type is in. The
-    /// mode belongs to the open socket rather than to a handle on it, so a duplicate of `listener`
-    /// made with [`try_clone`](std::os::unix::net::UnixListener::try_clone) is switched with it,
-    /// and an `accept` on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited. On Apple's platforms the socket also gets `SO_NOSIGPIPE`, which the
-    /// streams it accepts have as well, so that a write to a peer that has gone fails rather than
-    /// raising `SIGPIPE`.
+    /// `listener` is switched to non-blocking mode, as every listener of this type is. The mode
+    /// belongs to the open socket, so a duplicate made with
+    /// [`try_clone`](std::os::unix::net::UnixListener::try_clone) is switched too. An `accept` on
+    /// that duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, setting that option, and the runtime
-    /// taking the socket under its watch.
+    /// On Apple's platforms the socket also gets `SO_NOSIGPIPE`, and so do the streams it accepts,
+    /// so that a write to a peer that has gone fails instead of raising `SIGPIPE`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, if setting `SO_NOSIGPIPE` fails (on Apple's
+    /// platforms), or if the runtime cannot start watching the socket.
     pub fn from_std(
         runtime: &Runtime<M>,
         listener: std::os::unix::net::UnixListener,
@@ -155,50 +159,43 @@ where
 
     /// Waits for a connection to this listener, and accepts it.
     ///
-    /// Resolves to the stream of the connection, which runs on the listener's runtime and is in
-    /// non-blocking mode, and the address of the peer that made the connection, which is unnamed
-    /// unless the peer bound its socket to a path before it connected.
+    /// Returns the stream of the connection and the address of the peer that made it. The stream
+    /// runs on the listener's runtime and is in non-blocking mode. The address is unnamed unless
+    /// the peer bound its socket to a path before it connected.
     ///
-    /// Dropping the future before it completes gives up the wait. No connection is lost with it:
-    /// one that comes in meanwhile stays queued for the next call.
+    /// # Errors
     ///
-    /// An accept that fails resolves to the error. Where the error leaves the connection queued,
-    /// as the system running out of file descriptors (`EMFILE`) does on Linux and the BSDs, the
-    /// next call fails again at once, and so does each one after it for as long as the connection
-    /// stays queued: a loop that goes on accepting straight after an error spins the thread. On
-    /// Apple's platforms an accept that finds no descriptor left closes the connection it took off
-    /// the queue instead, so the error does not repeat, but the connection is lost. A caller that
-    /// goes on after an error backs off first, with [`Runtime::sleep`], say.
+    /// Returns the error of the accept.
+    ///
+    /// Some errors leave the connection queued, for example running out of file descriptors
+    /// (`EMFILE`) on Linux and the BSDs. The next call then fails again at once, and so on until
+    /// the connection leaves the queue, so a loop that keeps accepting after an error spins the
+    /// thread. Back off after an error, for example with [`Runtime::sleep`]. On Apple's platforms
+    /// an accept that finds no descriptor left closes the connection instead: the error does not
+    /// repeat, but the connection is lost.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait. No connection is lost: a
+    /// connection that arrives meanwhile stays queued for the next call.
     pub async fn accept(&self) -> io::Result<(UnixStream<M>, SocketAddr)> {
         let (stream, address) = self.io.read_with(|listener| listener.accept()).await?;
 
         self.accepted(stream, address)
     }
 
-    /// A stream of the connections made to this listener.
+    /// Returns a stream of the connections made to this listener.
     ///
     /// Each item is the [`UnixStream`] of a connection, accepted as
-    /// [`accept`](UnixListener::accept) accepts it, or the error of an accept that failed. The
-    /// stream never ends, and an error is not its end either. Nor does an error leave it pending
-    /// until the next connection comes in: polled again, it accepts again. Where the error left
-    /// the connection queued, as the system running out of file descriptors (`EMFILE`) does on
-    /// Linux and the BSDs, the next item is that error again at once, and so is each one after it
-    /// for as long as the connection stays queued, so a loop that goes on taking items straight
-    /// after an error spins the thread. On Apple's platforms an accept that finds no descriptor
-    /// left closes the connection it took off the queue instead, so the error does not repeat,
-    /// but the connection is lost. A caller that goes on after an error backs off first, with
-    /// [`Runtime::sleep`], say.
-    ///
-    /// At most one task at a time may wait for the next item, counting every stream this listener
-    /// hands out, and a task waiting in [`accept`](UnixListener::accept) does not count against
-    /// it, as [the stream's documentation](Incoming) says.
+    /// [`accept`](UnixListener::accept) accepts it, or the error of a failed accept. See
+    /// [`Incoming`] for how errors and waiting tasks behave.
     pub fn incoming(&self) -> Incoming<'_, M> {
         Incoming { listener: self }
     }
 
-    /// The local socket address this listener is bound to.
+    /// The socket address this listener is bound to.
     ///
-    /// It is the path the listener was bound to, which [`SocketAddr::as_pathname`] gives.
+    /// This is the path the listener was bound to, which [`SocketAddr::as_pathname`] returns.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
@@ -233,45 +230,40 @@ where
 
 /// A unix-domain connection, to read from and write to.
 ///
-/// A stream is made by connecting to the path a [`UnixListener`] is bound to with
-/// [`UnixStream::connect`], or to its address with [`UnixStream::connect_addr`], by a listener
-/// accepting a connection, or as one of a connected pair with [`UnixStream::pair`]. It is the async
-/// counterpart of [`std::os::unix::net::UnixStream`]: a read or a write that has to wait leaves the
-/// thread to the other tasks instead of blocking it.
+/// Create a stream with [`UnixStream::connect`] (by path), [`UnixStream::connect_addr`] (by
+/// address) or [`UnixStream::pair`], or get one from [`UnixListener::accept`]. The stream is the
+/// async counterpart of [`std::os::unix::net::UnixStream`]: a read or write that has to wait lets
+/// other tasks run instead of blocking the thread.
 ///
 /// The stream implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
-/// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
-/// `&UnixStream`, which lets a reader and a writer share one stream, as std's `Read` and `Write` do
-/// for a `&std::os::unix::net::UnixStream`. A write sends as much as the kernel takes at once,
-/// which may be less than the whole buffer, and nothing is held back, so flushing has nothing to
-/// do. A write to a peer that has gone away fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe).
+/// extension traits of [`futures`] work on it. So does `&UnixStream`, which lets a reader and a
+/// writer share one stream, as std's `Read` and `Write` do for a `&std::os::unix::net::UnixStream`.
+/// A write sends as much as the kernel takes at once, which may be less than the whole buffer.
+/// Nothing is buffered, so flushing does nothing. A write to a peer that has gone away fails with
+/// [`BrokenPipe`](io::ErrorKind::BrokenPipe).
 ///
-/// Closing the stream, as the `close` of `AsyncWriteExt` does, shuts down the write half of the
-/// socket, as [`shutdown`](UnixStream::shutdown) with [`Shutdown::Write`] does: the peer reads the
-/// end of the stream once it has read what was sent, while the read half stays open. It is the
-/// socket that is shut down, so closing the stream through one `&UnixStream` ends it for every
-/// handle on it, and closing a stream that is closed already is fine.
+/// Closing the stream (for example with the `close` method of `AsyncWriteExt`) shuts down the write
+/// half of the socket, like [`shutdown`](UnixStream::shutdown) with [`Shutdown::Write`]. The peer
+/// reads the end of the stream once it has read everything sent. The read half stays open. It is
+/// the socket that is shut down, so closing the stream through one `&UnixStream` ends it for every
+/// handle on it. Closing a stream that is already closed is not an error.
 ///
-/// The stream runs on the runtime given to the constructor that made it, whose reactor watches it
-/// from then on; a stream a [`UnixListener`] accepted is on the listener's runtime. Its operations
-/// make progress while some thread is inside [`Runtime::block_on`] on that runtime, or, on a
-/// runtime from `SharedRuntime::current`, while the helper thread runs it. The stream's type
-/// carries the flavour of that runtime: one built on a
-/// [`LocalRuntime`](crate::LocalRuntime) is a `UnixStream<Local>`, [`Local`] being the default,
-/// and stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime)
-/// is a `UnixStream<Shared>`, which may be sent to, and used from, any thread.
+/// The stream runs on the runtime passed to its constructor. A stream accepted by a
+/// [`UnixListener`] runs on the listener's runtime. The stream's type carries that runtime's
+/// flavour, as the [module documentation](super) explains: a `UnixStream<Local>` (the default)
+/// stays on the thread that made it, and a `UnixStream<Shared>` can be sent to and used from any
+/// thread.
 ///
-/// At most one task at a time may wait to read from a stream through its `AsyncRead`
-/// implementation, and at most one to write to it through its `AsyncWrite` one, counting every
-/// reference to the stream: where a second task waits in the same direction, the one that waited
-/// first may never be woken. Tasks that read, or write, together take turns, behind a lock of their
-/// own.
+/// Only one task at a time can wait to read through the `AsyncRead` implementation, and only one to
+/// write through `AsyncWrite`, counting all references to the stream. If a second task waits in the
+/// same direction, it replaces the first, which is then never woken. Tasks that read, or write,
+/// together must take turns, for example behind a lock.
 ///
 /// # Example
 ///
-/// A pair of connected streams: one sends a message and closes its end of the stream, the other
-/// reads the message up to the end of the stream, and the answer that still gets from the other to
-/// the one:
+/// A pair of connected streams. The client sends a message and closes its end of the stream. The
+/// server reads the message up to the end of the stream. The server can still send an answer to the
+/// client.
 ///
 /// ```
 /// use futures::{AsyncReadExt, AsyncWriteExt};
@@ -282,15 +274,15 @@ where
 ///
 /// runtime.block_on(async {
 ///     client.write_all(b"ping").await?;
-///     // Closing shuts the client's write half down: the server reads the end of the stream after
-///     // the bytes the client sent.
+///     // Closing shuts down the client's write half. The server reads the end of the stream
+///     // after the bytes the client sent.
 ///     client.close().await?;
 ///
 ///     let mut message = Vec::new();
 ///     server.read_to_end(&mut message).await?;
 ///     assert_eq!(message, b"ping");
 ///
-///     // The other direction is open still.
+///     // The other direction is still open.
 ///     server.write_all(b"pong").await?;
 ///     let mut answer = [0; 4];
 ///     client.read_exact(&mut answer).await?;
@@ -313,25 +305,31 @@ impl<M> UnixStream<M>
 where
     M: Mode,
 {
-    /// A stream connected to the socket at `path`, on `runtime`.
+    /// Creates a stream connected to the socket at `path`, on `runtime`.
     ///
-    /// `path` is the path a [`UnixListener`] is bound to. The connection does not block the
-    /// thread. It fails with [`NotFound`](io::ErrorKind::NotFound) where there is no file at
-    /// `path`, and with [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) where the file is
-    /// that of a socket nothing listens at any more. A path too long to name a socket, which is
-    /// about a hundred bytes, fails with [`InvalidInput`](io::ErrorKind::InvalidInput), as does
-    /// one with a zero byte in it, which std refuses wherever it takes a path for a socket.
+    /// `path` is the path a [`UnixListener`] is bound to. The connection does not block the thread.
     ///
-    /// On Linux and Android, a listener whose backlog is full has no room for another connection,
-    /// and a connect waits for room to open up, without blocking the thread: it tries again every
-    /// 20 milliseconds for as long as the caller awaits it. Nothing but the caller bounds that
-    /// wait, with a timeout of its own or by dropping the future, which gives up the attempt.
-    /// Other platforms refuse a connection to a listener whose backlog is full, which fails with
-    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) at once.
+    /// On Linux and Android, a listener whose backlog is full has no room for another connection.
+    /// The connect then waits for room to open up, without blocking the thread: it tries again
+    /// every 20 milliseconds for as long as the caller awaits it. Only the caller bounds this wait,
+    /// with a timeout or by dropping the future. Other platforms refuse a connection to a listener
+    /// whose backlog is full: the connect fails at once with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused).
     ///
-    /// To connect to a socket by its address as std gives it rather than by a path, which on
-    /// Linux and Android is the only way to reach one in the abstract namespace, see
-    /// [`connect_addr`](UnixStream::connect_addr).
+    /// To connect by a socket address as std gives it, rather than by a path, see
+    /// [`connect_addr`](UnixStream::connect_addr). On Linux and Android that is the only way to
+    /// reach a socket in the abstract namespace.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`NotFound`](io::ErrorKind::NotFound) if there is no file at `path`, and with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) if the file is a socket that nothing
+    /// listens on any more. Fails with [`InvalidInput`](io::ErrorKind::InvalidInput) if `path` is
+    /// too long to name a socket (about a hundred bytes) or contains a zero byte.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the connection attempt.
     pub async fn connect<P>(runtime: &Runtime<M>, path: P) -> io::Result<Self>
     where
         P: AsRef<Path>,
@@ -339,43 +337,45 @@ where
         Self::connect_sockaddr(runtime, &pathname_sockaddr(path.as_ref())?).await
     }
 
-    /// A stream connected to the socket at `address`, on `runtime`.
+    /// Creates a stream connected to the socket at `address`, on `runtime`.
     ///
     /// `address` is a socket address as std gives it, such as the
     /// [`local_addr`](UnixListener::local_addr) of a listener. It names a socket by the path it is
     /// bound to, which [`connect`](UnixStream::connect) takes as it is, or, on Linux and Android,
     /// by a name in the abstract namespace. Such a socket has no file behind it, and its name is a
-    /// string of bytes, any of them a zero byte: std's [`SocketAddrExt`] makes an address of a
-    /// name, and tells the name an address holds. An unnamed address, which is that of a socket
-    /// bound to nothing, such as either end of a [pair](UnixStream::pair), names no socket to
-    /// connect to, and this fails with [`InvalidInput`](io::ErrorKind::InvalidInput).
+    /// string of bytes, any of which may be a zero byte. std's [`SocketAddrExt`] creates an address
+    /// from a name and reads the name of an address.
     ///
-    /// The connection does not block the thread. For a path it fails as
-    /// [`connect`](UnixStream::connect) does: with [`NotFound`](io::ErrorKind::NotFound) where
-    /// there is no file at it, and with [`ConnectionRefused`](io::ErrorKind::ConnectionRefused)
-    /// where the file is that of a socket nothing listens at any more. A name in the abstract
-    /// namespace has no file to be missing, so a name nothing listens at fails with
-    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused).
+    /// The connection does not block the thread. A full listener backlog is handled as for
+    /// [`connect`](UnixStream::connect).
     ///
-    /// On Linux and Android, a listener whose backlog is full has no room for another connection,
-    /// and a connect waits for room to open up, without blocking the thread: it tries again every
-    /// 20 milliseconds for as long as the caller awaits it. Nothing but the caller bounds that
-    /// wait, with a timeout of its own or by dropping the future, which gives up the attempt.
-    /// Other platforms refuse a connection to a listener whose backlog is full, which fails with
-    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) at once.
+    /// # Errors
+    ///
+    /// For a path, the errors are those of [`connect`](UnixStream::connect). A name in the abstract
+    /// namespace has no file to be missing, so a name that nothing listens at fails with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused). An unnamed address belongs to a
+    /// socket bound to nothing, such as either end of a [pair](UnixStream::pair). It names no
+    /// socket to connect to, and fails with [`InvalidInput`](io::ErrorKind::InvalidInput).
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the connection attempt.
     ///
     /// [`SocketAddrExt`]: https://doc.rust-lang.org/std/os/linux/net/trait.SocketAddrExt.html
     pub async fn connect_addr(runtime: &Runtime<M>, address: &SocketAddr) -> io::Result<Self> {
         Self::connect_sockaddr(runtime, &named_sockaddr(address)?).await
     }
 
-    /// A connected pair of streams, on `runtime`.
+    /// Creates a connected pair of streams, on `runtime`.
     ///
-    /// What is written to one of them is read from the other, and the other way round, as for the
-    /// two ends of a connection made through a listener, but with no path to name them by. Both are
-    /// in non-blocking mode, as every stream of this type is.
+    /// What is written to one stream is read from the other, and the other way round. The streams
+    /// have no path to name them by. Both are in non-blocking mode, as every stream of this type
+    /// is.
     ///
-    /// What can fail is making the pair, and the runtime taking its sockets under its watch.
+    /// # Errors
+    ///
+    /// Fails if the system cannot create the pair, or if the runtime cannot start watching either
+    /// socket.
     pub fn pair(runtime: &Runtime<M>) -> io::Result<(Self, Self)> {
         let (first, second) = std::os::unix::net::UnixStream::pair()?;
 
@@ -385,17 +385,20 @@ where
         ))
     }
 
-    /// A stream on `runtime` that reads and writes the connection `stream` does.
+    /// Creates a stream on `runtime` from a std stream.
     ///
-    /// `stream` is switched to non-blocking mode, which every stream of this type is in. The mode
-    /// belongs to the open socket rather than to a handle on it, so a duplicate of `stream` made
-    /// with [`try_clone`](std::os::unix::net::UnixStream::try_clone) is switched with it, and a
-    /// read or a write on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited. On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a
-    /// write to a peer that has gone fails rather than raising `SIGPIPE`.
+    /// `stream` is switched to non-blocking mode, as every stream of this type is. The mode belongs
+    /// to the open socket, so a duplicate made with
+    /// [`try_clone`](std::os::unix::net::UnixStream::try_clone) is switched too. A read or write on
+    /// that duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, setting that option, and the runtime
-    /// taking the socket under its watch.
+    /// On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a write to a peer that has
+    /// gone fails instead of raising `SIGPIPE`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, if setting `SO_NOSIGPIPE` fails (on Apple's
+    /// platforms), or if the runtime cannot start watching the socket.
     pub fn from_std(
         runtime: &Runtime<M>,
         stream: std::os::unix::net::UnixStream,
@@ -408,36 +411,33 @@ where
         })
     }
 
-    /// The local socket address of the connection: this end of it.
+    /// The socket address of this end of the connection.
     ///
-    /// It names the path this end is bound to, if it is bound to one: the stream a listener
-    /// accepted is on the listener's path, while one that connected to a path, or is one of a
-    /// pair, is on none, and its address is unnamed.
+    /// It names the path this end is bound to, if any. A stream accepted by a listener is on the
+    /// listener's path. A stream that connected to a path, or is one of a pair, is bound to no
+    /// path, and its address is unnamed.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
 
-    /// The socket address of the peer the stream is connected to: the other end of the connection.
+    /// The socket address of the peer: the other end of the connection.
     ///
-    /// It names the path the peer is bound to, if it is bound to one, as
-    /// [`local_addr`](UnixStream::local_addr) does for this end.
+    /// It names the path the peer is bound to, if any, as [`local_addr`](UnixStream::local_addr)
+    /// does for this end.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().peer_addr()
     }
 
-    /// Stops watching the stream, and hands the socket back as a std stream, still in non-blocking
+    /// Stops watching the stream, and returns the socket as a std stream, still in non-blocking
     /// mode.
     ///
-    /// The runtime lets go of the socket, and the connection is left as it was: the std stream
-    /// reads the bytes that arrived and were not read yet. The socket stays in non-blocking mode,
-    /// as every stream of this type is, so a read or a write on the std stream fails with
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock) where it would have waited, until
-    /// [`set_nonblocking`](std::os::unix::net::UnixStream::set_nonblocking) switches the mode
-    /// back. Handing the socket to [`from_std`](UnixStream::from_std) takes it up again, on this
-    /// runtime or on another.
+    /// The connection is left as it was: the std stream can read the bytes that arrived but were
+    /// not read yet. The socket stays in non-blocking mode, so a read or write on the std stream
+    /// fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of waiting, until
+    /// [`set_nonblocking`](std::os::unix::net::UnixStream::set_nonblocking) switches the mode back.
     ///
-    /// On a shared runtime this may wait for a moment, while a thread driving the runtime returns
-    /// from a wait that watched the socket.
+    /// On a shared runtime this may wait briefly, until a thread driving the runtime returns from a
+    /// wait that was watching the socket.
     pub fn into_std(self) -> std::os::unix::net::UnixStream {
         self.io.into_inner()
     }
@@ -445,8 +445,8 @@ where
     /// Shuts down the read half, the write half or both halves of the connection, as `how` says.
     ///
     /// Shutting down the write half makes the peer read the end of the stream, once it has read
-    /// what was sent, which is what closing the stream does. It is the socket that is shut
-    /// down, so it holds for every handle on the stream.
+    /// everything sent. Closing the stream does the same. It is the socket that is shut down, so
+    /// this affects every handle on the stream.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.io.get_ref().shutdown(how)
     }
@@ -562,35 +562,36 @@ where
 
 /// A unix-domain datagram socket, to send datagrams from and receive datagrams on.
 ///
-/// A datagram socket exchanges datagrams, each a message of its own, rather than a stream of
-/// bytes. It is the async counterpart of [`std::os::unix::net::UnixDatagram`]: a receive or a send
-/// that has to wait leaves the thread to the other tasks instead of blocking it.
+/// A datagram socket exchanges datagrams, each a message of its own, instead of a stream of bytes.
+/// The socket is the async counterpart of [`std::os::unix::net::UnixDatagram`]: a receive or send
+/// that has to wait lets other tasks run instead of blocking the thread.
 ///
-/// A socket is bound to a path with [`UnixDatagram::bind`], so that others can send to it by that
-/// path; made [unbound](UnixDatagram::unbound), it can send but has no address to be sent to; and
-/// the two of a [pair](UnixDatagram::pair) are connected to each other. [`send_to`] sends a
-/// datagram to the socket bound to a path, and [`connect`] fixes the one socket to send to, and to
-/// receive from, which [`send`] and [`recv`] then use. A datagram keeps its boundaries: one
-/// receive takes one datagram, and what does not fit into the buffer it is given is discarded.
+/// Create a socket in one of these ways:
 ///
-/// The socket runs on the runtime given to the constructor that made it, whose reactor watches it
-/// from then on. Its operations make progress while some thread is inside [`Runtime::block_on`] on
-/// that runtime, or, on a runtime from `SharedRuntime::current`, while the helper thread runs it.
-/// The socket's type carries the flavour of that runtime: one built on a
-/// [`LocalRuntime`](crate::LocalRuntime) is a `UnixDatagram<Local>`, [`Local`] being the default,
-/// and stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime)
-/// is a `UnixDatagram<Shared>`, which may be sent to, and used from, any thread.
+/// * [`bind`](UnixDatagram::bind) binds it to a path, so that others can send to it by that path.
+/// * [`unbound`](UnixDatagram::unbound) creates a socket that can send but has no address to be
+///   sent to.
+/// * [`pair`](UnixDatagram::pair) creates two sockets that are connected to each other.
 ///
-/// Any number of tasks may wait to receive at once, through [`recv`](UnixDatagram::recv) or
-/// [`recv_from`](UnixDatagram::recv_from), and any number to send, through
+/// [`send_to`] sends a datagram to the socket bound to a path. [`connect`] fixes the one socket to
+/// send to and receive from, which [`send`] and [`recv`] then use. A datagram keeps its boundaries:
+/// one receive takes one datagram, and what does not fit into the buffer is discarded.
+///
+/// The socket runs on the runtime passed to its constructor. Its type carries that runtime's
+/// flavour, as the [module documentation](super) explains: a `UnixDatagram<Local>` (the default)
+/// stays on the thread that made it, and a `UnixDatagram<Shared>` can be sent to and used from any
+/// thread.
+///
+/// Any number of tasks can wait to receive at once, with [`recv`](UnixDatagram::recv) or
+/// [`recv_from`](UnixDatagram::recv_from), and any number can wait to send, with
 /// [`send`](UnixDatagram::send) or [`send_to`](UnixDatagram::send_to), each through a reference to
 /// the socket. Each receive takes a datagram of its own, so tasks that receive together get one
 /// each.
 ///
 /// # Example
 ///
-/// A pair of datagram sockets, one sending a datagram and the other receiving it, and the answer
-/// going the other way:
+/// A pair of datagram sockets: one sends a datagram and the other receives it, then the answer goes
+/// the other way.
 ///
 /// ```
 /// use zruntime::{LocalRuntime, net::unix::UnixDatagram};
@@ -627,16 +628,18 @@ impl<M> UnixDatagram<M>
 where
     M: Mode,
 {
-    /// A datagram socket bound to `path`, on `runtime`.
+    /// Creates a datagram socket bound to `path`, on `runtime`.
     ///
-    /// Binding creates a socket file at `path`, which must have no file already: where one is
-    /// there, a stale socket file left by an earlier socket included, this fails with
-    /// [`AddrInUse`](io::ErrorKind::AddrInUse), and removing that file first is the caller's to do.
-    /// The file the socket makes stays where it is when the socket is dropped, so whoever binds a
-    /// path removes the file when done with it. A path too long to name a socket, which is about a
-    /// hundred bytes, fails with [`InvalidInput`](io::ErrorKind::InvalidInput).
+    /// Binding creates a socket file at `path`. Dropping the socket does not remove the file, so
+    /// remove it when you are done with the socket.
     ///
-    /// What can fail is that, or what [`from_std`](UnixDatagram::from_std) can fail at.
+    /// # Errors
+    ///
+    /// Fails with [`AddrInUse`](io::ErrorKind::AddrInUse) if `path` already has a file. This
+    /// includes a stale socket file left by an earlier socket, which the caller must remove first.
+    /// Fails with [`InvalidInput`](io::ErrorKind::InvalidInput) if `path` is too long to name a
+    /// socket (about a hundred bytes). Also fails for the reasons
+    /// [`from_std`](UnixDatagram::from_std) fails.
     pub fn bind<P>(runtime: &Runtime<M>, path: P) -> io::Result<Self>
     where
         P: AsRef<Path>,
@@ -644,26 +647,30 @@ where
         Self::from_std(runtime, std::os::unix::net::UnixDatagram::bind(path)?)
     }
 
-    /// A datagram socket on `runtime` that is bound to no path.
+    /// Creates a datagram socket on `runtime` that is bound to no path.
     ///
-    /// Such a socket can send, to a path through [`send_to`](UnixDatagram::send_to) or to the
-    /// socket it is [connected](UnixDatagram::connect) to, but it has no address of its own, so
-    /// nothing can send to it, and the socket that receives its datagrams sees the address they
-    /// came from as unnamed.
+    /// Such a socket can send, to a path with [`send_to`](UnixDatagram::send_to) or to the socket
+    /// it is [connected](UnixDatagram::connect) to. It has no address of its own, so nothing can
+    /// send to it, and the socket that receives its datagrams sees the address they came from as
+    /// unnamed.
     ///
-    /// What can fail is making the socket, and what [`from_std`](UnixDatagram::from_std) can fail
-    /// at.
+    /// # Errors
+    ///
+    /// Fails if the system cannot create the socket, or for the reasons
+    /// [`from_std`](UnixDatagram::from_std) fails.
     pub fn unbound(runtime: &Runtime<M>) -> io::Result<Self> {
         Self::from_std(runtime, std::os::unix::net::UnixDatagram::unbound()?)
     }
 
-    /// A connected pair of datagram sockets, on `runtime`.
+    /// Creates a connected pair of datagram sockets, on `runtime`.
     ///
-    /// The datagrams one of them sends are received by the other, and the other way round, with no
-    /// path to name them by.
+    /// The datagrams one socket sends are received by the other, and the other way round. The
+    /// sockets have no path to name them by.
     ///
-    /// What can fail is making the pair, and what [`from_std`](UnixDatagram::from_std) can fail
-    /// at.
+    /// # Errors
+    ///
+    /// Fails if the system cannot create the pair, or for the reasons
+    /// [`from_std`](UnixDatagram::from_std) fails.
     pub fn pair(runtime: &Runtime<M>) -> io::Result<(Self, Self)> {
         let (first, second) = std::os::unix::net::UnixDatagram::pair()?;
 
@@ -673,17 +680,21 @@ where
         ))
     }
 
-    /// A datagram socket on `runtime` that sends and receives the datagrams `socket` does.
+    /// Creates a datagram socket on `runtime` from a std socket.
     ///
-    /// `socket` is switched to non-blocking mode, which every socket of this type is in. The mode
-    /// belongs to the open socket rather than to a handle on it, so a duplicate of `socket` made
-    /// with [`try_clone`](std::os::unix::net::UnixDatagram::try_clone) is switched with it, and a
-    /// receive or a send on that one fails with [`WouldBlock`](io::ErrorKind::WouldBlock) where it
-    /// would have waited. On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a send
-    /// to a peer that has gone fails rather than raising `SIGPIPE`.
+    /// `socket` is switched to non-blocking mode, as every socket of this type is. The mode belongs
+    /// to the open socket, so a duplicate made with
+    /// [`try_clone`](std::os::unix::net::UnixDatagram::try_clone) is switched too. A receive or
+    /// send on that duplicate then fails with [`WouldBlock`](io::ErrorKind::WouldBlock) instead of
+    /// waiting.
     ///
-    /// What can fail is the switch to non-blocking mode, setting that option, and the runtime
-    /// taking the socket under its watch.
+    /// On Apple's platforms the socket also gets `SO_NOSIGPIPE`, so that a send to a peer that has
+    /// gone fails instead of raising `SIGPIPE`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if switching to non-blocking mode fails, if setting `SO_NOSIGPIPE` fails (on Apple's
+    /// platforms), or if the runtime cannot start watching the socket.
     pub fn from_std(
         runtime: &Runtime<M>,
         socket: std::os::unix::net::UnixDatagram,
@@ -700,10 +711,15 @@ where
     ///
     /// From then on [`send`](UnixDatagram::send) sends to that socket, and
     /// [`recv`](UnixDatagram::recv) and [`recv_from`](UnixDatagram::recv_from) take only the
-    /// datagrams it sends. A datagram another socket sent before the connect may still be queued,
-    /// and is received like any other. Datagram sockets have no connection to wait for, so this
-    /// does not block: it fails where `path` names no socket that is bound, and it may be called
-    /// again to connect the socket to another one.
+    /// datagrams it sends. A datagram that another socket sent before the connect may still be
+    /// queued, and is received like any other.
+    ///
+    /// Datagram sockets have no connection to wait for, so this does not block. The socket can be
+    /// connected again, to another socket.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `path` names no socket that is bound.
     pub fn connect<P>(&self, path: P) -> io::Result<()>
     where
         P: AsRef<Path>,
@@ -713,20 +729,24 @@ where
 
     /// Sends `buf` as a datagram to the socket bound to `path`.
     ///
-    /// Resolves to the number of bytes sent. It fails where `path` names no socket that is bound:
-    /// with [`NotFound`](io::ErrorKind::NotFound) where there is no file there, and with
-    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) where the file is that of a socket
-    /// that is gone.
+    /// Returns the number of bytes sent.
     ///
-    /// A datagram that the system turns away with [`WouldBlock`](io::ErrorKind::WouldBlock), as
-    /// Linux does where the receiving socket has no room for it, is retried every 20 milliseconds,
-    /// on the runtime's timer and without blocking the thread, for as long as the caller awaits
-    /// the send. Nothing but the caller bounds that, with a timeout of its own or by dropping the
-    /// future, which gives up the send. A [connected](UnixDatagram::connect) socket's
-    /// [`send`](UnixDatagram::send) waits for room instead, and sends as soon as there is some.
+    /// If the system refuses the datagram with [`WouldBlock`](io::ErrorKind::WouldBlock), the send
+    /// is tried again every 20 milliseconds, on the runtime's timer and without blocking the
+    /// thread. Linux does this when the receiving socket has no room. Only the caller bounds this
+    /// wait, with a timeout or by dropping the future. In contrast, [`send`](UnixDatagram::send) on
+    /// a [connected](UnixDatagram::connect) socket waits for room and sends as soon as there is
+    /// some.
     ///
-    /// Any number of tasks may send at once, through this or [`send`](UnixDatagram::send), as [the
-    /// socket's documentation](UnixDatagram) says.
+    /// # Errors
+    ///
+    /// Fails with [`NotFound`](io::ErrorKind::NotFound) if there is no file at `path`, and with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) if the file is a socket that is
+    /// gone.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the send.
     pub async fn send_to<P>(&self, buf: &[u8], path: P) -> io::Result<usize>
     where
         P: AsRef<Path>,
@@ -747,25 +767,27 @@ where
 
     /// Waits for a datagram to arrive, and receives it into `buf`.
     ///
-    /// Resolves to the number of bytes received, and the address of the socket that sent the
-    /// datagram, which is unnamed unless that socket is bound to a path. A datagram longer than
-    /// `buf` is cut short, and the rest of it is discarded.
+    /// Returns the number of bytes received and the address of the socket that sent the datagram.
+    /// The address is unnamed unless that socket is bound to a path. A datagram longer than `buf`
+    /// is cut short, and the rest of it is discarded.
     ///
-    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
-    /// this or [`recv`](UnixDatagram::recv), as [the socket's documentation](UnixDatagram) says.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait. No datagram is lost: a datagram
+    /// that arrives meanwhile stays queued for the next receive.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.recv_from(buf)).await
     }
 
-    /// Waits for room in the socket, and sends `buf` as a datagram to the socket this one is
+    /// Waits until there is room to send, and sends `buf` as a datagram to the socket this one is
     /// connected to.
     ///
-    /// Resolves to the number of bytes sent. The socket has to be connected, to a path with
-    /// [`connect`](UnixDatagram::connect), or as one of a [pair](UnixDatagram::pair): a send
-    /// without a peer to send to fails.
+    /// Returns the number of bytes sent.
     ///
-    /// Any number of tasks may wait to send at once, through this or
-    /// [`send_to`](UnixDatagram::send_to), as [the socket's documentation](UnixDatagram) says.
+    /// # Errors
+    ///
+    /// Fails if the socket has no peer to send to. Connect it first with
+    /// [`connect`](UnixDatagram::connect), or create it with [`pair`](UnixDatagram::pair).
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         // Not std's `send`: that is a plain `write(2)`, which raises `SIGPIPE` on the BSDs and on
         // Apple's platforms after a `shutdown` of the write half. `send(2)` takes `MSG_NOSIGNAL`
@@ -779,37 +801,41 @@ where
     /// Waits for a datagram to arrive, and receives it into `buf`, without the address it came
     /// from.
     ///
-    /// Resolves to the number of bytes received. A datagram longer than `buf` is cut short, and the
-    /// rest of it is discarded. This is [`recv_from`](UnixDatagram::recv_from) for a socket that is
-    /// connected, to a path with [`connect`](UnixDatagram::connect) or as one of a
-    /// [pair](UnixDatagram::pair), and takes only its peer's datagrams from then on: it has no use
-    /// for the address of the sender. A datagram another socket sent before the connect may still
-    /// be queued, and is received all the same, without saying which socket sent it.
+    /// Returns the number of bytes received. This is [`recv_from`](UnixDatagram::recv_from) for a
+    /// socket that is connected, to a path with [`connect`](UnixDatagram::connect) or as one of a
+    /// [pair](UnixDatagram::pair). Such a socket takes only its peer's datagrams from then on, so
+    /// it has no use for the sender's address. A datagram that another socket sent before the
+    /// connect may still be queued, and is received all the same, without saying which socket sent
+    /// it. A datagram longer than `buf` is cut short, and the rest of it is discarded.
     ///
-    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
-    /// this or [`recv_from`](UnixDatagram::recv_from), as [the socket's
-    /// documentation](UnixDatagram) says.
+    /// # Cancel safety
+    ///
+    /// As for [`recv_from`](UnixDatagram::recv_from): dropping the future gives up the wait and
+    /// loses no datagram.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.recv(buf)).await
     }
 
-    /// The local socket address of the socket: the path it is bound to, which
-    /// [`SocketAddr::as_pathname`] gives, or an unnamed address where it is bound to none.
+    /// The socket address this socket is bound to.
+    ///
+    /// This is the path the socket is bound to, which [`SocketAddr::as_pathname`] returns, or an
+    /// unnamed address if it is bound to none.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
     }
 
-    /// The socket address of the socket this one is connected to, which is unnamed where that
-    /// socket is bound to no path.
+    /// The socket address of the socket this one is connected to.
     ///
-    /// It fails with [`NotConnected`](io::ErrorKind::NotConnected) where the socket is not
-    /// connected.
+    /// The address is unnamed if that socket is bound to no path.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`NotConnected`](io::ErrorKind::NotConnected) if the socket is not connected.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().peer_addr()
     }
 
-    /// Shuts down the receiving half, the sending half or both halves of the socket, as `how`
-    /// says.
+    /// Shuts down the receiving half, the sending half or both halves of the socket, as `how` says.
     ///
     /// A send after the sending half is shut down fails with
     /// [`BrokenPipe`](io::ErrorKind::BrokenPipe).
@@ -856,27 +882,23 @@ where
     }
 }
 
-/// A stream of the connections a [`UnixListener`] accepts, made by [`UnixListener::incoming`].
+/// A stream of the connections a [`UnixListener`] accepts, created by [`UnixListener::incoming`].
 ///
-/// Each item is the [`UnixStream`] of a connection, on the listener's runtime, or the error of an
-/// accept that failed. The stream never ends: it is pending while no connection waits, and yields
-/// the next one when it comes, for as long as it is polled. It implements the [`Stream`] trait of
-/// [`futures-core`], so the extension traits of [`futures`] drive it.
+/// Each item is the [`UnixStream`] of a connection, on the listener's runtime, or the error of a
+/// failed accept. The stream never ends. It is pending while no connection waits, and yields the
+/// next connection when it arrives. It implements the [`Stream`] trait of [`futures-core`], so the
+/// extension traits of [`futures`] work on it.
 ///
-/// An error is not the end of the stream either, and it does not leave the stream pending until
-/// the next connection comes in: polled again, the stream accepts again. Where the error left the
-/// connection queued, as the system running out of file descriptors (`EMFILE`) does on Linux and
-/// the BSDs, the next item is that error again at once, and so is each one after it for as long
-/// as the connection stays queued, so a loop that goes on taking items straight after an error
-/// spins the thread. On Apple's platforms an accept that finds no descriptor left closes the
-/// connection it took off the queue instead, so the error does not repeat, but the connection is
-/// lost. A caller that goes on after an error backs off first, with [`Runtime::sleep`], say.
+/// An error does not end the stream, and the stream does not stay pending until the next connection
+/// arrives: polled again, it accepts again. The errors are those of
+/// [`accept`](UnixListener::accept), which also describes what they leave behind. Some leave the
+/// connection queued, so the next item is the same error at once. A loop that keeps taking items
+/// after an error then spins the thread, so back off first, for example with [`Runtime::sleep`].
 ///
-/// At most one task at a time may wait for the next item, counting every `Incoming` of the
-/// listener: where a second task waits as well, the one that waited first may never be woken. Tasks
-/// that take items from one listener's streams take turns, behind a lock of their own. Tasks
-/// waiting in [`accept`](UnixListener::accept) do not count against that, nor does it count against
-/// them, as [the listener's documentation](UnixListener) says.
+/// Only one task at a time can wait for the next item, counting every `Incoming` of the listener.
+/// If a second task waits as well, it replaces the first, which is then never woken. Tasks that
+/// take items from one listener's streams must take turns, for example behind a lock. Tasks waiting
+/// in [`accept`](UnixListener::accept) do not count against this limit, nor the other way round.
 ///
 /// [`futures-core`]: https://docs.rs/futures-core
 /// [`futures`]: https://docs.rs/futures

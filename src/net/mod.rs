@@ -1,50 +1,57 @@
 //! Async sockets on a [`Runtime`].
 //!
-//! Each family of socket is behind a cargo feature of its own, none of them on by default: `tcp`
-//! brings `TcpListener` and `TcpStream`, `udp` brings `UdpSocket`, and `unix` brings the `unix`
-//! module, with `UnixListener`, `UnixStream` and `UnixDatagram`, on unix platforms only.
+//! The module has TCP sockets (`TcpListener` and `TcpStream`), a UDP socket (`UdpSocket`) and, on
+//! unix platforms, unix-domain sockets in the `unix` module (`UnixListener`, `UnixStream` and
+//! `UnixDatagram`). The families are behind the `tcp`, `udp` and `unix` cargo features, none on by
+//! default.
 //!
 //! # The runtime
 //!
-//! A socket is built on a runtime, which its constructor takes as its first argument, and that
-//! runtime's reactor watches it from then on: its operations make progress while some thread is
-//! inside [`Runtime::block_on`] on that runtime, or, on a runtime from `SharedRuntime::current`,
-//! while the helper thread runs it. The socket's type carries the runtime's flavour. One built on
-//! a [`LocalRuntime`] is, say, a `TcpStream<Local>`, `Local` being the default, and stays on the
-//! thread it was made on; one built on a [`SharedRuntime`] is a `TcpStream<Shared>`, which may be
-//! sent to, and used from, any thread.
+//! A socket is created on a runtime. Its constructor takes the runtime as the first argument, and
+//! the runtime's reactor watches the socket from then on.
+//!
+//! The socket's operations make progress while a thread is running [`Runtime::block_on`] on that
+//! runtime. A runtime from `SharedRuntime::current` also has a helper thread, which drives the
+//! runtime when no thread is running `block_on` on it.
+//!
+//! The socket's type carries the flavour of its runtime. A socket made on a [`LocalRuntime`] is,
+//! for example, a `TcpStream<Local>` (`Local` is the default). It stays on the thread that made it.
+//! A socket made on a [`SharedRuntime`] is a `TcpStream<Shared>`. It can be sent to and used from
+//! any thread.
 //!
 //! # Operations
 //!
-//! A socket is in non-blocking mode for as long as it is one of these, and an operation on it
-//! that would block waits for the runtime to report the socket ready instead, leaving the thread
-//! to the other tasks in the meantime. Connecting is one such operation, so a `connect` never
-//! blocks the thread either.
+//! Sockets are in non-blocking mode. When an operation would block, the task waits until the
+//! runtime reports the socket ready, and other tasks run on the thread in the meantime. Connecting
+//! is such an operation too, so `connect` never blocks the thread.
 //!
-//! A TCP or UDP socket is bound or connected to a socket address, never to a host name: looking a
-//! name up, through std's `ToSocketAddrs` say, blocks the thread for as long as the resolver
-//! takes, which a task must not do to the thread it shares with the others. A caller with a name
-//! to connect to looks it up on a thread of its own (`unblock`, with the `unblock` feature, runs
-//! such work), and tries the addresses it finds in turn.
+//! TCP and UDP sockets are bound or connected to a socket address, never to a host name. Looking up
+//! a name, for example with std's `ToSocketAddrs`, blocks the thread until the resolver answers,
+//! and a task must not do that. To connect to a host name, look it up on another thread (for
+//! example with `unblock`), then try the addresses it returns in turn.
 //!
-//! The streams, `TcpStream` and `UnixStream`, implement the `AsyncRead` and `AsyncWrite` traits
-//! of [`futures-io`], so the extension traits of [`futures`] read from and write to them. So does a
-//! shared reference to one, which lets a reader and a writer share a stream. Closing a stream shuts
-//! its write half down, and the peer reads the end of the stream.
+//! `TcpStream` and `UnixStream` implement the `AsyncRead` and `AsyncWrite` traits of
+//! [`futures-io`], so the extension traits of [`futures`] work on them. A shared reference to a
+//! stream implements the traits too, so a reader and a writer can share one stream. Closing a
+//! stream shuts down its write half, and the peer then reads the end of the stream.
 //!
-//! Any number of tasks may wait in the async methods of one socket at once, through shared
-//! references to it: to accept, peek, receive or send, in either direction. Each is woken when the
-//! socket is ready, and one that finds another task got there first waits again. Only the
-//! poll-based paths keep one waiting task per direction: the `AsyncRead` and `AsyncWrite`
-//! implementations of a stream, and the `Incoming` stream of a listener. Where a second task waits
-//! in the same direction through one of those, it takes the first one's place, which is then never
-//! woken, so tasks that share a direction there take turns, behind a lock of their own. A task
-//! waiting in an async method never takes the place of one waiting through a poll-based path, nor
-//! the other way round.
+//! # Several tasks on one socket
 //!
-//! On Windows, a runtime watches at most 1023 sockets at a time, which its reactor waits on in a
-//! single `select` call: a server there holds at most that many sockets on one runtime, its
-//! listener included.
+//! Any number of tasks can wait in the async methods of one socket at once, through shared
+//! references. These are the methods that accept, peek, receive or send, in either direction. When
+//! the socket becomes ready, the waiting tasks wake. A task that finds another task took the data
+//! first waits again.
+//!
+//! Two paths allow only one waiting task per direction: the `AsyncRead` and `AsyncWrite`
+//! implementations of a stream, and the `Incoming` stream of a listener. If a second task waits in
+//! the same direction through one of them, it replaces the first, which is then never woken. Tasks
+//! that share a direction there must take turns, for example behind a lock. A task waiting in an
+//! async method never replaces a task waiting through one of these paths, nor the other way round.
+//!
+//! # Limits on Windows
+//!
+//! On Windows, a runtime watches at most 1023 sockets at a time. A server there can hold at most
+//! that many sockets on one runtime, its listener included.
 //!
 //! [`futures-io`]: https://docs.rs/futures-io
 //! [`futures`]: https://docs.rs/futures
