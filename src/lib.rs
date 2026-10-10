@@ -85,34 +85,34 @@ pub use time::{Interval, MissedTickBehavior, Sleep, TimedOut, Timeout};
 #[cfg(feature = "unblock")]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
-/// Runs `future` to completion on the calling thread, running that thread's runtime alongside it.
+/// Runs `future` to completion on the calling thread, together with the thread's own runtime.
 ///
-/// This is for a program that has no async runtime of its own. Put the async code in one call to
-/// this function; the call blocks the thread until the future completes. In between polls of the
-/// future, the calling thread also runs the scheduler and the reactor of everything built on the
-/// runtime this call drives — every task spawned, source registered or timer armed from inside
-/// it on [`SharedRuntime::current`] — and two threads that each call this drive their own
-/// runtime, in parallel. If the call returns while some of that work is still alive, a helper
-/// thread takes it over until the next call, or until the work is gone.
+/// Each thread has its own [`SharedRuntime`] for this function, which [`SharedRuntime::current`]
+/// returns from inside `future`. The call blocks the thread until `future` completes. Meanwhile,
+/// the thread also runs the tasks, timers and I/O of its runtime. Threads that call this each run
+/// their own runtime, in parallel.
 ///
-/// The scheduler and the reactor of a runtime are run by one thread at a time, the one in the
-/// runtime's seat. A call takes the seat if it is free and keeps it until its future is done, so
-/// a program that drives its work through this function runs it on its own thread and starts no
-/// helper. A call that finds the seat taken parks instead, to be polled again when its future is
-/// woken or the seat is freed. A call that arrives while the helper is in the seat is given it,
-/// the helper parking until that call leaves, so that a program calling this once per operation
-/// runs each of them on its own thread rather than behind a thread of the runtime's own.
+/// Work that is still alive when the call returns, such as a detached task, runs on a helper thread
+/// until the next call, or until it is done. A call that starts while the helper is running the
+/// runtime takes the runtime over from it. So a program that calls this once per operation still
+/// runs each operation on the thread that called it.
 ///
-/// Because that work runs on the calling thread in between polls, the future must not block that
-/// thread waiting for it. A synchronous wait for a task's result, or a busy loop until a signal
-/// arrives, never finishes.
+/// One thread at a time runs a runtime. If another thread is running it already, the call waits for
+/// its turn, and polls `future` whenever it is woken in the meantime.
 ///
-/// Do not call this from inside a task this runtime is running. It panics there, because it
-/// would be waiting for the very thread it is on. Do not call it from another runtime's task
-/// either: it blocks that task's thread until the future completes, which deadlocks the program
-/// if the future needs that thread to make progress.
+/// `future` must not block the thread to wait for work on the runtime, for example by waiting
+/// synchronously for a task's result. That work runs on this same thread, between polls of
+/// `future`, so such a wait never ends.
 ///
-/// This is only available when the `helper` feature is enabled.
+/// Do not call this from a task of another executor either. It blocks that executor's thread until
+/// `future` completes, which deadlocks if `future` needs that thread.
+///
+/// # Panics
+///
+/// Panics if the calling thread is already running a runtime, for example when called from a task
+/// or from the future passed to another `block_on`. Such a call would wait for its own thread.
+///
+/// Requires the `helper` feature.
 #[cfg(feature = "helper")]
 pub fn block_on<F>(future: F) -> F::Output
 where
@@ -121,39 +121,30 @@ where
     driver::block_on(driver::Target::Own, &driver::own, future)
 }
 
-/// Queues `future` on the shared runtime the calling code is running on, and hands back the task
-/// that joins or cancels it.
+/// Spawns `future` on the shared runtime that runs the calling code.
 ///
-/// This is `SharedRuntime::spawn` for code that has no runtime to name: a function that is
-/// called from a task, say, and was handed no clone of the runtime running it, nor a name to give
-/// the task. The task is named by where it was spawned instead, for the message logged if it
-/// panics and for its `Debug`. Dropping the task cancels it, and [`Task::detach`] lets it run on,
-/// as for a task spawned on a runtime by name.
+/// This is `SharedRuntime::spawn` for code that has no runtime handle, such as a function called
+/// from a task. The task is named after the place it was spawned from, for its `Debug` output and
+/// for the log message if it panics. As with any task, dropping the returned [`Task`] cancels it,
+/// and [`Task::detach`] lets it run on.
 ///
-/// The task goes on the first of these that exists:
+/// The task goes on the first of these runtimes that exists:
 ///
-/// 1. The shared runtime the calling thread drives. That is the one it is inside
-///    [`Runtime::block_on`] on, whether it was made by [`Runtime::new`] or handed out by
-///    `SharedRuntime::current`; the one whose seat it is in, where the `helper` feature gives it
-///    one; and the one whose task it is running, on a thread inside `block_on` as on the helper
-///    thread.
-/// 2. With the `helper` feature, the runtime `SharedRuntime::current` hands out: the thread's own
-///    inside the free `block_on`, and the one the whole process shares everywhere else, which a
-///    helper thread runs.
+/// 1. The shared runtime that the calling thread is running: the runtime it called
+///    [`Runtime::block_on`] on, its own runtime inside the free `block_on`, or the runtime whose
+///    task it is running, on a thread that called `block_on` or on a helper thread.
+/// 2. With the `helper` feature, the runtime that `SharedRuntime::current` returns.
 ///
-/// The first differs on purpose from `SharedRuntime::current`, which does not count a `block_on`
-/// on a runtime made by [`Runtime::new`], and hands out the one the process shares there. A task
-/// spawned here goes on the runtime that runs the code spawning it, so that the thread inside
-/// `block_on` runs it, as it runs every other task of its runtime, rather than a helper thread
-/// that is running some other runtime.
+/// So the task goes on the runtime that runs the code spawning it. For a runtime created by
+/// [`Runtime::new`], that is not the runtime `SharedRuntime::current` would return.
 ///
-/// A future that need not be `Send` is spawned with [`spawn_local`], on a local runtime.
+/// For a future that is not `Send`, use [`spawn_local`] on a local runtime.
 ///
 /// # Panics
 ///
-/// Panics where the calling thread drives no shared runtime and the `helper` feature, which
-/// gives it a runtime to spawn on in that case, is not enabled. With the feature, it panics only
-/// where `SharedRuntime::current` would fail: where the reactor of the runtime cannot be made.
+/// Without the `helper` feature, panics if the calling thread is not running a shared runtime. With
+/// it, panics only if `SharedRuntime::current` fails, because the OS cannot provide the resources a
+/// new runtime needs.
 ///
 /// # Example
 ///
@@ -184,21 +175,17 @@ where
     spawn_on_shared(&shared_to_spawn_on(), name, future)
 }
 
-/// Queues `future` on the local runtime the calling code is running on, and hands back the task
-/// that joins or cancels it.
+/// Spawns `future` on the local runtime that runs the calling code.
 ///
-/// This is `LocalRuntime::spawn` for code that has no runtime to name, as [`spawn`] is for a
-/// shared one: the task is named by where it was spawned, and goes on the local runtime the
-/// calling thread drives. That is the one it is inside [`Runtime::block_on`] on, or the one whose
-/// task it is running. A local runtime stays on the thread that made it, so the thread running the
-/// spawning code is the only one that can be driving it, and there is no other runtime to look
-/// for in its place.
+/// This is `LocalRuntime::spawn` for code that has no runtime handle, as [`spawn`] is for a shared
+/// runtime. The task is named after the place it was spawned from. It goes on the local runtime
+/// that the calling thread is running: the one it called [`Runtime::block_on`] on, or the one whose
+/// task it is running.
 ///
 /// # Panics
 ///
-/// Panics where the calling thread drives no local runtime: outside any `block_on`, and inside
-/// the `block_on` of a shared runtime, whose tasks may run on any thread and have no local runtime
-/// to go on.
+/// Panics if the calling thread is not running a local runtime. That includes calls from the future
+/// passed to `block_on` on a shared runtime, and from tasks of a shared runtime.
 ///
 /// # Example
 ///
@@ -240,35 +227,32 @@ where
     Task(scheduler::spawn_local(&core, name, future))
 }
 
-/// A runtime that stays on the thread it was made on, and runs futures that need not be `Send`.
+/// A runtime that stays on the thread that created it, and runs futures that need not be `Send`.
 #[cfg(feature = "runtime")]
 pub type LocalRuntime = Runtime<Local>;
 
-/// A runtime that may be reached from, and driven on, any thread, and runs `Send` futures.
+/// A runtime that can be used from, and run on, any thread, and runs `Send` futures.
 #[cfg(feature = "runtime")]
 pub type SharedRuntime = Runtime<Shared>;
 
-/// A handle to a runtime: a scheduler and a reactor, driven by whichever thread is inside
+/// A handle to a runtime: a scheduler and a reactor, which run on the thread that calls
 /// [`Runtime::block_on`] on it.
 ///
-/// Cloning it is cheap, and every clone reaches the same scheduler and reactor. The runtime goes
-/// once the last clone, and the last timer and registration built on it, are gone; a task left
-/// unfinished then is dropped, and its handle fails. A task handle does not keep its runtime
-/// alive, but a task whose future holds a clone, a timer or a registration does, for as long as
-/// the task lives.
+/// Cloning the handle is cheap, and all clones refer to the same runtime. The runtime is dropped
+/// once its last handle, timer and registration are dropped. Any unfinished task is dropped with
+/// it, and awaiting its [`Task`] then fails. A [`Task`] does not keep its runtime alive, but a task
+/// whose future holds a handle, a timer or a registration does, for as long as the task lives.
 ///
-/// `M` is the runtime's flavour: [`Local`], the default, for a runtime that stays on its thread,
-/// or [`Shared`] for one that may be reached from any thread.
+/// `M` is the flavour of the runtime: [`Local`], the default, for a runtime that stays on its
+/// thread, or [`Shared`] for one that can be used from any thread.
 ///
-/// Reach for [`Local`] unless a handle, a task or a future built on this runtime must cross
-/// threads or be polled by another executor: it is the cheaper of the two, with nothing behind
-/// atomics or locks beyond what a [`Waker`](std::task::Waker) forces. [`Shared`] costs an `Arc`
-/// and a `Mutex` where `Local` costs an `Rc` and a `RefCell`, and only runs `Send` futures, in
-/// return for being usable from, and drivable on, any thread.
+/// Prefer [`Local`] unless the runtime, a task or a future built on it must cross threads, or be
+/// polled by another executor. It is the cheaper flavour: it uses `Rc` and `RefCell` where
+/// [`Shared`] uses `Arc` and `Mutex`. [`Shared`] also only runs `Send` futures.
 ///
-/// Either way, a runtime is driven by one thread at a time, so all of its tasks share one core.
-/// Work that needs more runs on several runtimes, one per thread, as
-/// [Running on several threads](crate#running-on-several-threads) describes.
+/// Either way, one thread at a time runs a runtime, so all its tasks share one CPU core. To use
+/// more cores, use several runtimes: see
+/// [Running on several threads](crate#running-on-several-threads).
 #[cfg(feature = "runtime")]
 pub struct Runtime<M = Local>
 where
@@ -282,51 +266,53 @@ impl<M> Runtime<M>
 where
     M: Mode,
 {
-    /// A fresh runtime, with nothing to do.
+    /// Creates a runtime.
     ///
-    /// The runtime has no thread of its own: what is spawned, registered or timed on it runs
-    /// only while some thread is inside [`Runtime::block_on`] on it, and waits for the next such
-    /// call in between.
+    /// The runtime has no thread of its own. Its tasks, timers and I/O make progress only while a
+    /// thread is running [`Runtime::block_on`] on it.
     ///
-    /// A task whose future holds a timer, a registration or a clone of the runtime keeps the
-    /// runtime, and the descriptors its reactor holds, alive until the task ends. No helper thread
-    /// ever runs a runtime made here, so a detached task that never ends is never let go of: drive
-    /// such a task to completion, or keep its [`Task`] and cancel it, by dropping that or through
+    /// A task whose future holds a handle, a timer or a registration of the runtime keeps the
+    /// runtime, and the OS resources of its reactor, alive until the task ends. No helper thread
+    /// ever runs a runtime created here, so a detached task that never ends is never dropped. Drive
+    /// such a task to completion, or keep its [`Task`] to cancel it, by dropping it or with
     /// [`Task::cancel`].
     ///
-    /// What can fail is the reactor: it opens the channel a wait is broken through.
+    /// A plain `Runtime::new()` leaves the compiler unable to infer `M`. Call [`LocalRuntime::new`]
+    /// or [`SharedRuntime::new`] instead, or name the flavour with a turbofish.
     ///
-    /// Called as `Runtime::new()`, this leaves `M` for the compiler to guess at, which it cannot
-    /// do from an empty argument list: name [`LocalRuntime::new`] or [`SharedRuntime::new`]
-    /// instead, or give `new` a turbofish.
+    /// # Errors
+    ///
+    /// Fails if the OS cannot provide the resources the reactor needs.
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             core: Core::<M>::new()?,
         })
     }
 
-    /// Runs `future` to completion on the calling thread, driving this runtime alongside it.
+    /// Runs `future` to completion on the calling thread, and runs this runtime alongside it.
     ///
-    /// The call blocks the thread until the future completes. In between polls of the future,
-    /// the calling thread also runs the runtime's scheduler and reactor: every task spawned,
-    /// source registered or timer armed on it runs on this thread for as long as the call lasts.
+    /// The call blocks the thread until `future` completes. Meanwhile, the thread also runs the
+    /// runtime's tasks, timers and I/O. Everything spawned, registered or timed on the runtime runs
+    /// on this thread for as long as the call lasts.
     ///
-    /// Because that work runs on the calling thread in between polls, the future must not block
-    /// that thread waiting for it. A synchronous wait for a task's result, or a busy loop until a
-    /// signal arrives, never finishes.
+    /// `future` must not block the thread to wait for that work, for example by waiting
+    /// synchronously for a task's result, or by spinning until a task sets a flag. That work runs
+    /// on this same thread, between polls of `future`, so such a wait never ends.
     ///
     /// # Panics
     ///
-    /// Panics where the calling thread is driving a runtime already: from inside a task a runtime
-    /// is running, or from inside the future of another `block_on`. Such a call would be waiting
-    /// for the very thread it is on. With the `helper` feature, a call on a runtime made by
-    /// [`Runtime::new`] panics, too, from inside the future of a call of the free `block_on` or of
-    /// a `block_on` on a runtime from `SharedRuntime::current`, whether or not that call is driving
-    /// its runtime at that moment. A shared runtime made by [`Runtime::new`] is driven by one
-    /// thread at a time, so this panics, too, where another thread is inside `block_on` on the
-    /// same runtime. One handed out by `SharedRuntime::current`, which the `helper` feature adds,
-    /// has a seat for whoever drives it instead: a call on it waits for the seat, and is given it
-    /// by the helper thread, as a call of the free `block_on` is.
+    /// Panics if the calling thread is already running a runtime, for example when called from a
+    /// task or from the future passed to another `block_on`. Such a call would wait for its own
+    /// thread.
+    ///
+    /// A shared runtime created by [`Runtime::new`] is run by one thread at a time, so the call
+    /// also panics if another thread is running `block_on` on it. A runtime from
+    /// `SharedRuntime::current` does not panic in that case: the call waits for its turn instead,
+    /// and takes the runtime over from the helper thread, as the free `block_on` does.
+    ///
+    /// With the `helper` feature, a call on a runtime created by [`Runtime::new`] also panics when
+    /// made from the future passed to the free `block_on`, or to `block_on` on a runtime from
+    /// `SharedRuntime::current`.
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future,
@@ -335,6 +321,9 @@ where
     }
 
     /// A future that completes once `duration` has passed. Dropping it cancels the timer.
+    ///
+    /// A `duration` too long for the clock to represent, such as `Duration::MAX`, gives a sleep
+    /// that never completes.
     pub fn sleep(&self, duration: Duration) -> Sleep<M> {
         // This runtime's timers run on the standard clock, so a length of time is a deadline on
         // it — where the clock has a moment that far ahead. `Duration::MAX`, which a wait of
@@ -345,14 +334,12 @@ where
         Sleep(reactor::sleep::<M>(&self.core, deadline))
     }
 
-    /// A future that completes once `deadline` has passed: at once, on its first poll, where it
-    /// already has. Dropping it cancels the timer.
+    /// A future that completes once `deadline` has passed, or on its first poll if it already has.
+    /// Dropping it cancels the timer.
     ///
-    /// This is what a loop that has to keep to a schedule reaches for. One that sleeps for a
-    /// period in each round drifts by however long the work of that round took, and the error
-    /// adds up with every round. One that adds the period to a deadline of its own and sleeps
-    /// until that deadline starts each round when it was due, however long the rounds before it
-    /// took.
+    /// Use this to keep a loop to a schedule. A loop that sleeps for a period in each round drifts
+    /// by the time the work of each round takes, and the error adds up. A loop that adds the period
+    /// to a deadline and sleeps until that deadline starts each round on time.
     ///
     /// # Example
     ///
@@ -379,17 +366,16 @@ where
         Sleep(reactor::sleep::<M>(&self.core, Some(deadline)))
     }
 
-    /// A future that runs `future` until it completes or `duration` has passed, whichever comes
-    /// first: it resolves to what `future` produced, or to [`TimedOut`] where the time ran out.
-    /// Dropping it drops `future` and cancels the timer.
+    /// Puts a time limit of `duration` on `future`.
     ///
-    /// The clock starts here, at the call, rather than at the first poll: a timeout made well
-    /// before it is awaited has had that much of its time already. A duration further ahead than
-    /// the clock can name, as `Duration::MAX` is, gives a timeout that never fires. Each poll
-    /// gives `future` its turn before it looks at the clock, so a future that completes on the
-    /// very poll its time runs out on still hands back its output. A future that runs out of time
-    /// is not dropped there: it lives on inside the timeout, which [`Timeout::into_inner`] hands
-    /// it back from, to be retried or driven on.
+    /// The returned future resolves to `Ok` with the output of `future` if it completes in time,
+    /// and to `Err` with [`TimedOut`] otherwise. Dropping it drops `future` and cancels the timer.
+    ///
+    /// The clock starts at this call, not at the first poll. A `duration` too long for the clock to
+    /// represent, such as `Duration::MAX`, never times out. Each poll polls `future` before it
+    /// checks the clock, so a future that completes on the poll in which its time runs out still
+    /// returns its output. A future that times out is not dropped: [`Timeout::into_inner`] returns
+    /// it, to retry it or keep driving it.
     ///
     /// # Example
     ///
@@ -423,13 +409,13 @@ where
         Timeout::new(future.into_future(), self.sleep(duration))
     }
 
-    /// A future that runs `future` until it completes or `deadline` has passed, whichever comes
-    /// first, as [`timeout`](Self::timeout) does: where `deadline` has passed already, a future
-    /// that is not ready on its first poll times out on that poll. Dropping it drops `future` and
-    /// cancels the timer.
+    /// Puts a deadline on `future`, as [`timeout`](Self::timeout) puts a time limit on it.
     ///
-    /// This is what a piece of work made of several steps reaches for, to keep all of them to
-    /// one deadline rather than give each a length of time of its own.
+    /// If `deadline` has already passed, a future that is not ready on its first poll times out on
+    /// that poll. Dropping the returned future drops `future` and cancels the timer.
+    ///
+    /// Use this to keep several steps of one piece of work to one deadline, rather than give each
+    /// step a duration of its own.
     ///
     /// # Example
     ///
@@ -460,17 +446,18 @@ where
         Timeout::new(future.into_future(), self.sleep_until(deadline))
     }
 
-    /// A timer that ticks once every `period`, the first time one period from now. An interval
-    /// asked for further ahead than the clock can name never ticks.
+    /// A timer that ticks once every `period`, starting one period from now.
     ///
-    /// Each tick hands out the moment it was scheduled for, and the ticks keep to the schedule
-    /// however long the work done at each of them takes. A tick missed because the task was busy,
-    /// or its thread blocked, for a period or more is made up for as the interval's
-    /// [`MissedTickBehavior`] says: by default, at once.
+    /// Each tick returns the moment it was scheduled for. The ticks keep to the schedule however
+    /// long the work done at each tick takes. If ticks are missed, because the task was busy or its
+    /// thread blocked for a period or more, the interval's [`MissedTickBehavior`] decides how to
+    /// catch up. By default, the missed ticks fire at once.
+    ///
+    /// A `period` too long for the clock to represent gives an interval that never ticks.
     ///
     /// # Panics
     ///
-    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    /// Panics if `period` is zero.
     ///
     /// # Example
     ///
@@ -497,13 +484,15 @@ where
         Interval::new(self.sleep(period), period)
     }
 
-    /// A timer that ticks once every `period`, as [`interval`](Self::interval) does, the first
-    /// time at `start`: at once, on its first poll, where `start` has passed already, as it has
-    /// for `interval_at(Instant::now(), period)`.
+    /// A timer that ticks once every `period`, as [`interval`](Self::interval) does, starting at
+    /// `start`.
+    ///
+    /// If `start` has already passed, the first tick comes on the first poll, as it does for
+    /// `interval_at(Instant::now(), period)`.
     ///
     /// # Panics
     ///
-    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    /// Panics if `period` is zero.
     pub fn interval_at(&self, start: Instant, period: Duration) -> Interval<M> {
         Interval::new(self.sleep_until(start), period)
     }
@@ -511,17 +500,16 @@ where
 
 #[cfg(feature = "runtime")]
 impl Runtime<Local> {
-    /// Queues `future` under the diagnostic name `name` and hands back the task that joins or
-    /// cancels it.
+    /// Spawns `future` as a task named `name`, and returns its [`Task`].
     ///
-    /// The task runs concurrently with the caller, on the thread inside [`Runtime::block_on`] on
-    /// this runtime. The handle resolves to what `future` produced, or to `Err` where the runtime
-    /// lost the task — after it panicked, say. Dropping the handle cancels the task;
+    /// The task runs concurrently with the caller, on the thread that runs [`Runtime::block_on`] on
+    /// this runtime. Awaiting the [`Task`] returns the output of `future`, or `Err` if the runtime
+    /// lost the task, for example because it panicked. Dropping the [`Task`] cancels the task, and
     /// [`Task::detach`] lets it run on.
     ///
-    /// `name` says what the task is there for — `"socket reader"`, say. It is for diagnostics
-    /// only: it is what the message logged if the task panics names it by. Code with no runtime
-    /// to call this on spawns with [`spawn_local`], which takes no name.
+    /// `name` says what the task is for, such as `"socket reader"`. It is only used for
+    /// diagnostics, for example in the log message if the task panics. Code that has no runtime
+    /// handle can spawn with [`spawn_local`] instead, which takes no name.
     pub fn spawn<T>(
         &self,
         name: impl Into<Cow<'static, str>>,
@@ -537,28 +525,27 @@ impl Runtime<Local> {
         ))
     }
 
-    /// Watches `source` for readiness.
+    /// Starts watching `source` for readiness.
     ///
-    /// `source` must be in nonblocking mode, which this leaves to the caller to set: the runtime
-    /// waits for readiness, not for I/O, so a read or write on a blocking source blocks the
-    /// thread running every other task along with it. The runtime asks `source` for its
-    /// descriptor once, here, and watches that one from then on, so `source` keeps it the same,
-    /// and open, for as long as it lives, as every type of std's does.
+    /// `source` must already be in non-blocking mode. The runtime only waits for readiness: a read
+    /// or write on a blocking source blocks the thread, and every other task with it. The runtime
+    /// gets the descriptor of `source` once, here, and watches that descriptor from then on. So
+    /// `source` must keep the same descriptor open for as long as it lives, as every std type does.
     ///
-    /// The registration this hands back stops watching `source` once it is dropped. A read or
-    /// write on `source` should go through [`Registration::poll_io`], so that a `WouldBlock`
-    /// becomes a wait for the readiness that would clear it rather than a busy loop. `source`
-    /// itself is kept by the registration, so the I/O is done through another handle on the
-    /// same socket: an `Rc` of it, say, or a clone of its descriptor.
+    /// Dropping the returned [`Registration`] stops the watch. Do each read or write through
+    /// [`Registration::poll_io`], which turns a `WouldBlock` into a wait for readiness instead of a
+    /// busy loop. The registration keeps `source`, so do the I/O through another handle to the same
+    /// socket: an `Rc` of it, for example, or a clone of its descriptor.
     ///
-    /// A runtime watches a descriptor through one registration at a time: a source whose
-    /// descriptor it watches already is turned away with
-    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
-    /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
+    /// [`AsyncIo`] does all of this for you: it registers a source, keeps it and does the I/O.
+    /// [`Registration::ready`] only waits for readiness, for code that does its I/O some other way.
     ///
-    /// [`AsyncIo`] is the handle that registers a source, keeps it and does the I/O for the caller;
-    /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
-    /// other way.
+    /// # Errors
+    ///
+    /// Fails if the OS cannot watch `source`. A runtime also watches each descriptor through only
+    /// one registration at a time. While another registration watches the descriptor of `source`,
+    /// this fails with [`AlreadyExists`](io::ErrorKind::AlreadyExists). A cloned descriptor, such
+    /// as `try_clone` returns, is a different descriptor.
     ///
     /// # Example
     ///
@@ -604,32 +591,30 @@ impl Runtime<Local> {
 
 #[cfg(feature = "runtime")]
 impl Runtime<Shared> {
-    /// A handle on the runtime for what this thread builds, brought into being here if none is
-    /// alive.
+    /// The runtime for the calling code, created if none is alive.
     ///
-    /// Which runtime that is depends on where the call is made. On a thread in the seat of a
-    /// runtime — inside [`block_on`], or on the helper thread running a task —
-    /// it is that runtime. On a thread inside `block_on` but not in any seat, it is the runtime
-    /// the innermost such call drives: the thread's own runtime for a call of the free
-    /// [`block_on`], and the runtime it was called on for a [`Runtime::block_on`]. Anywhere else,
-    /// it is one runtime the whole process shares, for work some other executor polls: such
-    /// work has no thread of its own to look to, so a helper thread runs it, and one runtime
-    /// for all of it is one helper and one pair of descriptors rather than a set per thread.
+    /// Which runtime that is depends on where it is called from:
     ///
-    /// A runtime handed out here goes once its last handle, and the last of the work built on
-    /// it, are gone; the next call brings a fresh one into being. Work built on it runs on the
-    /// thread in its seat: one inside `block_on` on it, where there is one, and a helper thread,
-    /// started where that work is found with nobody in the seat and gone once nothing is left to
-    /// run, watch or time, where there is not.
+    /// 1. From the future passed to the free [`block_on`], the calling thread's own runtime.
+    /// 2. From the future passed to `block_on` on a runtime from this function, or from a task of
+    ///    such a runtime, that runtime.
+    /// 3. From anywhere else, a runtime that the whole process shares. A helper thread runs it.
+    ///    This is the runtime for work that another executor polls, which has no thread of its own
+    ///    to run it.
     ///
-    /// A [`LocalRuntime::block_on`], or a `block_on` on a runtime made by [`Runtime::new`], does
-    /// not count as a `block_on` here: it drives the runtime it was called on and no other. A call
-    /// made inside one gives the runtime the process shares, and a helper thread runs what is
-    /// built on it, while the thread inside that `block_on` is left to its own runtime. (A
-    /// `block_on` of that kind made the other way round, inside the future of a `block_on` this
-    /// feature adds, panics.)
+    /// `block_on` on a [`LocalRuntime`], or on a runtime created by [`Runtime::new`], does not
+    /// count here: it only runs its own runtime. Called from its future or its tasks, this returns
+    /// the runtime the process shares, and a helper thread runs what is built on it.
     ///
-    /// What can fail is the reactor: it opens the channel a wait is broken through.
+    /// A runtime from this function is dropped once its last handle, and the last work built on it,
+    /// are gone. The next call then creates a new one. Its work runs on the thread that is running
+    /// `block_on` on it, if there is one. Otherwise a helper thread runs it. The helper starts when
+    /// there is work and no thread runs the runtime, and stops once nothing is left to run, watch
+    /// or time.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the OS cannot provide the resources the reactor of a new runtime needs.
     ///
     /// # Example
     ///
@@ -666,7 +651,7 @@ impl Runtime<Shared> {
     /// assert_eq!(&received, b"!");
     /// ```
     ///
-    /// This is only available when the `helper` feature is enabled.
+    /// Requires the `helper` feature.
     #[cfg(feature = "helper")]
     pub fn current() -> io::Result<Self> {
         Ok(Self {
@@ -674,18 +659,17 @@ impl Runtime<Shared> {
         })
     }
 
-    /// Queues `future` under the diagnostic name `name` and hands back the task that joins or
-    /// cancels it.
+    /// Spawns `future` as a task named `name`, and returns its [`Task`].
     ///
-    /// The task runs concurrently with the caller, on whichever thread is inside
-    /// [`Runtime::block_on`] on this runtime, or, on a runtime from `SharedRuntime::current`, on
-    /// a helper thread where no such thread is there to run it. The handle resolves to what
-    /// `future` produced, or to `Err` where the runtime lost the task — after it panicked, say.
-    /// Dropping the handle cancels the task; [`Task::detach`] lets it run on.
+    /// The task runs concurrently with the caller, on the thread that runs [`Runtime::block_on`] on
+    /// this runtime. On a runtime from `SharedRuntime::current`, a helper thread runs it when no
+    /// such thread does. Awaiting the [`Task`] returns the output of `future`, or `Err` if the
+    /// runtime lost the task, for example because it panicked. Dropping the [`Task`] cancels the
+    /// task, and [`Task::detach`] lets it run on.
     ///
-    /// `name` says what the task is there for — `"socket reader"`, say. It is for diagnostics
-    /// only: it is what the message logged if the task panics names it by. Code with no runtime
-    /// to call this on spawns with [`spawn`], which takes no name.
+    /// `name` says what the task is for, such as `"socket reader"`. It is only used for
+    /// diagnostics, for example in the log message if the task panics. Code that has no runtime
+    /// handle can spawn with [`spawn`] instead, which takes no name.
     pub fn spawn<T>(
         &self,
         name: impl Into<Cow<'static, str>>,
@@ -697,28 +681,27 @@ impl Runtime<Shared> {
         spawn_on_shared(&self.core, Name::Given(name.into()), future)
     }
 
-    /// Watches `source` for readiness.
+    /// Starts watching `source` for readiness.
     ///
-    /// `source` must be in nonblocking mode, which this leaves to the caller to set: the runtime
-    /// waits for readiness, not for I/O, so a read or write on a blocking source blocks the
-    /// thread running every other task along with it. The runtime asks `source` for its
-    /// descriptor once, here, and watches that one from then on, so `source` keeps it the same,
-    /// and open, for as long as it lives, as every type of std's does.
+    /// `source` must already be in non-blocking mode. The runtime only waits for readiness: a read
+    /// or write on a blocking source blocks the thread, and every other task with it. The runtime
+    /// gets the descriptor of `source` once, here, and watches that descriptor from then on. So
+    /// `source` must keep the same descriptor open for as long as it lives, as every std type does.
     ///
-    /// The registration this hands back stops watching `source` once it is dropped. A read or
-    /// write on `source` should go through [`Registration::poll_io`], so that a `WouldBlock`
-    /// becomes a wait for the readiness that would clear it rather than a busy loop. `source`
-    /// itself is kept by the registration, so the I/O is done through another handle on the
-    /// same socket: an `Arc` of it, say, or a clone of its descriptor.
+    /// Dropping the returned [`Registration`] stops the watch. Do each read or write through
+    /// [`Registration::poll_io`], which turns a `WouldBlock` into a wait for readiness instead of a
+    /// busy loop. The registration keeps `source`, so do the I/O through another handle to the same
+    /// socket: an `Arc` of it, for example, or a clone of its descriptor.
     ///
-    /// A runtime watches a descriptor through one registration at a time: a source whose
-    /// descriptor it watches already is turned away with
-    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
-    /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
+    /// [`AsyncIo`] does all of this for you: it registers a source, keeps it and does the I/O.
+    /// [`Registration::ready`] only waits for readiness, for code that does its I/O some other way.
     ///
-    /// [`AsyncIo`] is the handle that registers a source, keeps it and does the I/O for the caller;
-    /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
-    /// other way.
+    /// # Errors
+    ///
+    /// Fails if the OS cannot watch `source`. A runtime also watches each descriptor through only
+    /// one registration at a time. While another registration watches the descriptor of `source`,
+    /// this fails with [`AlreadyExists`](io::ErrorKind::AlreadyExists). A cloned descriptor, such
+    /// as `try_clone` returns, is a different descriptor.
     pub fn register<S>(&self, source: S) -> io::Result<Registration<Shared>>
     where
         S: AsSource + Send + Sync + 'static,
@@ -791,9 +774,10 @@ pub enum Interest {
     Writable,
 }
 
-/// A task spawned on a [`Runtime`], which cancels that task when dropped.
+/// A handle to a task spawned on a [`Runtime`]. Dropping it cancels the task.
 ///
-/// [`Task::cancel`] cancels it as well, and waits for it to stop.
+/// Awaiting it returns the output of the task, or an error if the task panicked or was dropped with
+/// its runtime. [`Task::cancel`] cancels the task and waits for it to stop.
 #[cfg(feature = "runtime")]
 pub struct Task<T, M = Local>(JoinHandle<T, M>)
 where
@@ -804,40 +788,44 @@ impl<T, M> Task<T, M>
 where
     M: Mode,
 {
-    /// Lets the task run to completion on its own.
+    /// Lets the task run to completion without a handle.
     ///
-    /// A detached task is the runtime's to keep: it runs until it ends, whenever a thread is
-    /// inside [`Runtime::block_on`] on its runtime, and on a runtime from
-    /// `SharedRuntime::current`, on a helper thread where no such thread is there to run it. A
-    /// task that never ends is kept, with everything its future holds, for as long as the runtime
-    /// lives, and where a helper runs it, keeps that helper for the life of the process.
+    /// The runtime keeps a detached task until it ends. The task runs whenever a thread is running
+    /// [`Runtime::block_on`] on its runtime. On a runtime from `SharedRuntime::current`, a helper
+    /// thread runs it when no such thread does. A task that never ends is kept, with everything its
+    /// future holds, for as long as the runtime lives. If a helper thread runs it, it keeps that
+    /// helper for the life of the process.
     pub fn detach(self) {
         self.0.detach();
     }
 
-    /// Cancels the task, and hands back a future that resolves once the task's future is gone.
+    /// Cancels the task, and returns a future that resolves once the task's future is dropped.
     ///
-    /// Dropping a task cancels it too, but does not wait: a task that another thread is polling
-    /// at that moment is left to finish that poll, and its future, with everything it holds, goes
-    /// only then. Cancelling it here, and awaiting what this hands back, is for a caller that has
-    /// to know when that is — to bind a socket to the address of one the task held, say, or to
-    /// take a lock it held — or that wants the output of a task that may have finished already.
+    /// Dropping a [`Task`] cancels it too, but does not wait. If another thread is polling the task
+    /// at that moment, its future, and everything the future holds, is only dropped once that poll
+    /// returns. Use this method when you need to know when that is, for example to bind to the
+    /// address of a socket the task held, or to take a lock it held. Use it also to get the output
+    /// of a task that may have finished already.
     ///
-    /// The cancellation is made here, in the call, whether or not the future handed back is ever
-    /// polled. A task that is waiting, or has not been polled yet, has its future dropped right
-    /// here, on the calling thread. One that is being polled at that moment has it dropped once
-    /// that poll returns: by another thread, or by this one where a task cancels itself. And
-    /// where the runtime is going just then, its last handle being dropped, perhaps on another
-    /// thread, the runtime drops the future as it goes, which may be after this call has
-    /// returned. It is awaiting the future handed back that tells when the task's future is
-    /// gone: that resolves once it has been dropped, however that came about, to the task's
-    /// output where the task had finished before the cancellation reached it, and to `None`
-    /// otherwise. A task that panicked, went with its runtime, or had its output taken already
-    /// by being awaited has none to hand back either. Dropping that future is the same as
-    /// dropping the task.
+    /// This call cancels the task, whether or not the returned future is ever polled:
     ///
-    /// A task's future whose destructor panics as it is dropped here panics out of this call, as
-    /// it would out of a drop of the task.
+    /// * If the task is waiting, or has not been polled yet, its future is dropped right here, on
+    ///   the calling thread.
+    /// * If the task is being polled, its future is dropped once that poll returns. That happens on
+    ///   another thread, or on this one if the task cancels itself.
+    /// * If the runtime is being dropped at the same time, perhaps on another thread, the runtime
+    ///   drops the future, possibly after this call has returned.
+    ///
+    /// The returned future resolves once the task's future has been dropped, in whichever of these
+    /// ways. It resolves to the task's output if the task finished before it was cancelled, and to
+    /// `None` otherwise. It is also `None` if the task panicked, was dropped with its runtime, or
+    /// already returned its output to an `.await`. Dropping the returned future is the same as
+    /// dropping the [`Task`].
+    ///
+    /// # Panics
+    ///
+    /// If the destructor of the task's future panics as it is dropped here, the panic propagates
+    /// out of this call, as it would out of dropping the [`Task`].
     ///
     /// # Example
     ///
@@ -872,15 +860,14 @@ where
         self.0.cancel()
     }
 
-    /// Whether the task has ended, told without polling it or taking its output.
+    /// Whether the task has ended, without polling it or taking its output.
     ///
-    /// A task has ended once its future has completed or panicked, or has gone with the runtime
-    /// it was on. Either way, the future has been dropped, and everything it held with it, by the
-    /// time this says so.
+    /// A task has ended once its future has completed or panicked, or was dropped with its runtime.
+    /// In each case, the future, and everything it held, has been dropped by the time this returns
+    /// `true`.
     ///
-    /// This stays `true` after the output has been taken by awaiting the task. It is how a caller
-    /// that has no use for the output yet, or ever, finds out that a task is over, where awaiting
-    /// the task would take that output.
+    /// It stays `true` after awaiting the task has taken its output. Use it to find out that a task
+    /// is over when you do not want to take its output.
     ///
     /// # Example
     ///

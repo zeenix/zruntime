@@ -42,48 +42,50 @@ use std::os::windows::io::{AsSocket as AsSource, BorrowedSocket as BorrowedSourc
 
 /// The flavour of a [`Runtime`](crate::Runtime): [`Local`] or [`Shared`].
 ///
-/// Implemented by exactly those two, and by nothing outside this crate.
+/// Only those two implement it. It cannot be implemented outside this crate.
 pub trait Mode: sealed::Sealed {}
 
-/// The flavour of a runtime that stays on the thread it was made on.
+/// The flavour of a runtime that stays on the thread that created it.
 ///
-/// A local runtime runs any `'static` future, `Send` or not, and holds its state in [`Rc`] and
-/// [`RefCell`] rather than behind atomics and locks. Its handles, and the task handles, timers
-/// and registrations built on it, cannot be sent to another thread.
+/// A local runtime runs any `'static` future, `Send` or not. It keeps its state in [`Rc`] and
+/// [`RefCell`] rather than behind atomics and locks. Its handles, and the tasks, timers and
+/// registrations built on it, cannot be sent to another thread.
 ///
-/// This is a marker type: it has no values, and is only ever named as a type parameter.
+/// This is a marker type. It has no values, and is only used as a type parameter.
 #[derive(Debug)]
 pub enum Local {}
 
 impl Mode for Local {}
 
-/// The flavour of a runtime that may be reached from, and driven on, any thread.
+/// The flavour of a runtime that can be used from, and run on, any thread.
 ///
-/// A shared runtime runs `Send` futures only, and holds its state in [`Arc`] and [`Mutex`]. Its
-/// handles, and the task handles, timers and registrations built on it, are `Send` and `Sync`.
+/// A shared runtime only runs `Send` futures. It keeps its state in [`Arc`] and [`Mutex`]. Its
+/// handles, and the tasks, timers and registrations built on it, are `Send` and `Sync`.
 ///
-/// This is a marker type: it has no values, and is only ever named as a type parameter.
+/// This is a marker type. It has no values, and is only used as a type parameter.
 #[derive(Debug)]
 pub enum Shared {}
 
 impl Mode for Shared {}
 
-/// A source a runtime of the flavour `M` can watch for readiness, and so what an
-/// [`AsyncIo`](crate::AsyncIo) built on such a runtime can wrap.
+/// A source that a runtime of flavour `M` can watch for readiness, and so can wrap in an
+/// [`AsyncIo`](crate::AsyncIo).
 ///
-/// On unix that is anything with a file descriptor (`std::os::fd::AsFd`): a socket, a pipe, a
-/// terminal or an eventfd, say. Linux and Android cannot watch a regular file, a directory or
-/// `/dev/null`, and a wait on one fails there. On Windows it is anything with a socket
+/// On unix, that is anything with a file descriptor (`std::os::fd::AsFd`), such as a socket, a
+/// pipe, a terminal or an eventfd. Linux and Android cannot watch a regular file, a directory or
+/// `/dev/null`, and waiting on one fails there. On Windows, it is anything with a socket
 /// (`std::os::windows::io::AsSocket`), the only kind of handle the runtime's `select` can watch
-/// there. A [`Local`] runtime watches such a source of any type. A [`Shared`] runtime watches one
-/// that is [`Send`] and [`Sync`] as well: the thread driving it, whichever that is, holds the
-/// source while it waits.
+/// there.
 ///
-/// The runtime asks the source for its descriptor once, as it takes the source under its watch,
-/// and watches that descriptor from then on. A source keeps the descriptor it lends the same, and
-/// open, for as long as it lives, as every type of std's does.
+/// A [`Local`] runtime watches such a source of any type. A [`Shared`] runtime also needs it to be
+/// [`Send`] and [`Sync`], because whichever thread is running the runtime holds the source while it
+/// waits.
 ///
-/// Implemented for every type that qualifies, and by nothing outside this crate.
+/// The runtime gets the descriptor of the source once, when it starts watching it, and watches that
+/// descriptor from then on. So the source must keep the same descriptor open for as long as it
+/// lives, as every std type does.
+///
+/// It is implemented for every type that qualifies, and cannot be implemented outside this crate.
 pub trait Source<M = Local>: AsSource + 'static + sealed::IntoSource<M>
 where
     M: Mode,

@@ -22,18 +22,17 @@ use futures_core::Stream;
 
 use crate::{Local, Mode, reactor};
 
-/// A future run against a deadline on a [`Runtime`](crate::Runtime): it resolves to what the
-/// future produced where that comes first, or to [`TimedOut`] once the deadline has passed.
+/// A future with a deadline on a [`Runtime`](crate::Runtime). It resolves to the output of the
+/// future if that comes first, or to [`TimedOut`] once the deadline has passed.
 ///
-/// Each poll gives the future its turn first, and looks at the deadline only where the future is
-/// still waiting, so a future that completes on the very poll the deadline passes on hands back
-/// its output rather than losing it. Like a [`Sleep`], a timeout costs nothing until a poll leaves
-/// it waiting: one whose future completes on its first poll never looks at its deadline at all,
-/// and so never asks for a thread to fire it.
+/// Each poll polls the future first, and only checks the deadline if the future is still pending.
+/// So a future that completes on the poll in which the deadline passes still returns its output.
+/// Like a [`Sleep`], a timeout costs nothing until a poll leaves it pending: if its future
+/// completes on the first poll, it never starts its timer.
 ///
-/// The future is not dropped when the deadline passes. It lives on inside the timeout until that
-/// is dropped, or is handed back by [`into_inner`](Self::into_inner), to be retried, or driven on
-/// with no deadline at all.
+/// The future is not dropped when the deadline passes. It stays inside the timeout until the
+/// timeout is dropped, or until [`into_inner`](Self::into_inner) returns it, to retry it or to keep
+/// driving it without a deadline.
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Timeout<F, M = Local>
 where
@@ -52,13 +51,15 @@ where
         &self.future
     }
 
-    /// The future this runs, to change in place.
+    /// The future this runs, mutably.
     pub fn get_mut(&mut self) -> &mut F {
         &mut self.future
     }
 
-    /// The future this runs, handed back with the deadline let go of: what a caller reaches for
-    /// after a time-out, to retry the future, or to recover a stream or a socket it was reading.
+    /// The future this runs, without the deadline.
+    ///
+    /// Use this after a timeout, to retry the future, or to get back a stream or a socket it was
+    /// reading.
     ///
     /// # Example
     ///
@@ -130,11 +131,10 @@ where
     }
 }
 
-/// The error a [`Timeout`] resolves to where its deadline passed before its future completed.
+/// The error of a [`Timeout`] whose deadline passed before its future completed.
 ///
-/// Only this crate makes one. It converts into an [`io::Error`] of the kind
-/// [`TimedOut`](io::ErrorKind::TimedOut), so that code returning an `io::Result`, as network code
-/// so often does, can hand a time-out on with `?`.
+/// It converts into an [`io::Error`] of kind [`TimedOut`](io::ErrorKind::TimedOut), so code that
+/// returns an `io::Result` can pass a timeout on with `?`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TimedOut;
@@ -153,21 +153,19 @@ impl From<TimedOut> for io::Error {
     }
 }
 
-/// A timer on a [`Runtime`](crate::Runtime) that ticks once every period, rather than once: what a
-/// heartbeat, a poll of some outside state or any other piece of work done on a schedule reaches
-/// for.
+/// A timer on a [`Runtime`](crate::Runtime) that ticks once every period, for work done on a
+/// schedule such as a heartbeat.
 ///
-/// Each tick hands out the moment it was scheduled for, rather than the moment it was seen, so a
-/// loop that does its work at each tick keeps to the schedule however long a round of that work
-/// takes, and however late the task gets round to the next tick. A tick that comes due while
-/// nobody waits for it is not lost: the next wait for a tick finds it at once. Where a whole period
-/// or more goes by in that way, ticks are missed, and what the interval does about them is its
-/// [`MissedTickBehavior`].
+/// Each tick returns the moment it was scheduled for, not the moment it was seen. So a loop that
+/// does its work at each tick keeps to the schedule, however long each round of work takes and
+/// however late the task gets to the next tick. A tick that comes due while nothing waits for it is
+/// not lost: the next wait for a tick returns it at once. If a whole period or more passes like
+/// that, ticks are missed, and the interval's [`MissedTickBehavior`] decides what to do about them.
 ///
-/// An interval is a [`Stream`] of the instants it ticks at, which never ends, so the extension
-/// traits of [`futures`] drive it as well as [`tick`](Self::tick) does. Like a [`Sleep`], it costs
-/// nothing until it is first polled, and holds its runtime, so a task holding one keeps that
-/// runtime alive.
+/// An interval is also a [`Stream`] of the instants it ticks at, which never ends. So the extension
+/// traits of [`futures`] can drive it as well as [`tick`](Self::tick) can. Like a [`Sleep`], it
+/// costs nothing until it is first polled. It holds its runtime, so a task that holds an interval
+/// keeps the runtime alive.
 ///
 /// [`Stream`]: futures_core::Stream
 /// [`futures`]: https://docs.rs/futures
@@ -185,19 +183,19 @@ impl<M> Interval<M>
 where
     M: Mode,
 {
-    /// Waits for the next tick, and completes with the moment it was scheduled for.
+    /// Waits for the next tick, and returns the moment it was scheduled for.
     ///
-    /// Dropping the future this hands back before it completes loses no tick: the next wait finds
-    /// it all the same.
+    /// Dropping the future before it completes loses no tick: the next wait returns it.
     pub async fn tick(&mut self) -> Instant {
         poll_fn(|cx| self.poll_tick(cx)).await
     }
 
-    /// Polls for the next tick, which completes with the moment that tick was scheduled for.
+    /// Polls for the next tick, which returns the moment it was scheduled for.
     ///
-    /// Where the tick has not come due yet, the waker of `cx` is woken once it has; only the waker
-    /// of the last poll is, so one task at a time waits on an interval. An interval asked for
-    /// further ahead than the clock can name never ticks, and stays pending for good.
+    /// If the tick is not due yet, the waker of `cx` is woken once it is. Only the waker of the
+    /// last poll is woken, so only one task at a time can wait on an interval. Once the next tick
+    /// is too far ahead for the clock to represent, as one a period of `Duration::MAX` ahead is,
+    /// the interval stays pending forever.
     pub fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
         // A timer with no deadline never completes, and its poll would do nothing at all.
         let Some(deadline) = self.sleep.deadline() else {
@@ -221,27 +219,26 @@ where
         Poll::Ready(deadline)
     }
 
-    /// Starts the schedule over, with the next tick one period from now, or none at all where the
-    /// clock cannot name that moment.
+    /// Restarts the schedule, with the next tick one period from now.
     ///
-    /// A tick that had come due, and that nobody had waited for yet, is dropped. This is what an
-    /// idle timer reaches for, which only has to tick once a period has gone by with nothing else
-    /// happening.
+    /// If the clock cannot represent that moment, the interval never ticks again. A tick that was
+    /// due and not yet waited for is dropped. Use this for an idle timer, which should only tick
+    /// after a whole period with nothing else happening.
     pub fn reset(&mut self) {
         self.sleep.reset_after(self.period);
     }
 
-    /// How long this interval waits from one tick to the next.
+    /// The time between two ticks.
     pub fn period(&self) -> Duration {
         self.period
     }
 
-    /// What this interval does about ticks it missed.
+    /// What this interval does about missed ticks.
     pub fn missed_tick_behavior(&self) -> MissedTickBehavior {
         self.missed_tick_behavior
     }
 
-    /// Changes what this interval does about ticks it missed, from the next tick it hands out on.
+    /// Sets what this interval does about missed ticks, starting with the next tick it returns.
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.missed_tick_behavior = behavior;
     }
@@ -288,51 +285,45 @@ where
     }
 }
 
-/// What an [`Interval`] does about ticks it missed because nobody waited for them in time: the
-/// task polling it was busy with something else, or the thread it runs on was blocked.
+/// What an [`Interval`] does about ticks that nothing waited for in time, because the task polling
+/// it was busy or its thread was blocked.
 ///
-/// A tick is missed where, by the time the tick before it is handed out, its own moment has passed
-/// already. Each variant below is shown on the same timeline: a period of 10 ms, ticks scheduled at
-/// 10, 20, 30 ms and so on, the tick at 10 handed out on time, and the task then held up until 35,
-/// when it hands out the tick at 20 and finds the one at 30 missed.
+/// A tick is missed if its moment has already passed by the time the tick before it is returned.
+/// The variants below use the same example: a period of 10 ms, with ticks scheduled at 10, 20, 30
+/// ms and so on. The tick at 10 is returned on time. The task is then held up until 35, when it
+/// gets the tick at 20 and finds the one at 30 missed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MissedTickBehavior {
-    /// The missed ticks are handed out one after the other, at once, until the interval has caught
-    /// up, and the schedule is kept: the ticks at 20 and 30 are both handed out at 35, and the next
-    /// one at 40, then 50.
+    /// The missed ticks are returned one after the other, at once, until the interval has caught
+    /// up, and the schedule stays the same. The ticks at 20 and 30 are both returned at 35, and the
+    /// next ones at 40 and 50.
     ///
-    /// This is what a piece of work that has to happen once for each period that went by, however
-    /// late, reaches for.
+    /// Use this for work that must happen once for each period, however late.
     #[default]
     Burst,
-    /// The next tick comes one full period after the late one was handed out, and the schedule
-    /// moves with it: the tick at 20 is handed out at 35, and the next one at 45, then 55.
+    /// The next tick comes one full period after the late one was returned, and the schedule moves
+    /// with it. The tick at 20 is returned at 35, and the next ones at 45 and 55.
     ///
-    /// This is what a piece of work that needs a full period of rest between two rounds of it
-    /// reaches for.
+    /// Use this for work that needs a full period of rest between two rounds.
     Delay,
-    /// The missed ticks are dropped, and the next tick is the first one of the schedule still to
-    /// come: the tick at 20 is handed out at 35, the one at 30 never is, and the next one comes at
-    /// 40, then 50.
+    /// The missed ticks are dropped, and the next tick is the next one on the schedule that is
+    /// still to come. The tick at 20 is returned at 35, the one at 30 never is, and the next ones
+    /// come at 40 and 50.
     ///
-    /// This is what a piece of work that only has to keep to the schedule, and gains nothing from
-    /// making up for a round it missed, reaches for.
+    /// Use this for work that only needs to keep to the schedule, and gains nothing from catching
+    /// up on a missed round.
     Skip,
 }
 
-/// A timer on a [`Runtime`](crate::Runtime), which keeps a thread on it for as long as it has a
-/// deadline.
+/// A timer on a [`Runtime`](crate::Runtime), which completes once its deadline has passed.
 ///
-/// The reactor takes a timer's deadline on the first poll of it rather than where it is made, and
-/// the thread that is to fire it has to be there from that poll onwards, however long ago the
-/// timer was asked for. So it is the poll that asks for one — a helper thread, on a runtime from
-/// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
-/// costs nothing at all. A timer can be moved to another deadline in place, by
-/// [`reset`](Self::reset) or [`reset_after`](Self::reset_after), and a reset asks for no thread of
-/// its own: a timer the reactor holds a deadline of has one already, and any other takes its new
-/// deadline on its next poll, which asks as a first poll does. A timer holds its runtime, so a task
-/// holding one keeps that runtime alive: nothing here takes a runtime down while it has work.
+/// The deadline is fixed when the timer is created, but the timer only registers with the reactor
+/// on its first poll, so it costs nothing until then. That poll also makes sure that a thread will
+/// be there to fire it. On a runtime from `SharedRuntime::current` that no thread is running
+/// `block_on` on, that means starting a helper thread. [`reset`](Self::reset) and
+/// [`reset_after`](Self::reset_after) move a timer to another deadline in place. A timer holds its
+/// runtime, so a task that holds a timer keeps the runtime alive.
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Sleep<M = Local>(pub(crate) reactor::Sleep<M>)
 where
@@ -342,25 +333,28 @@ impl<M> Sleep<M>
 where
     M: Mode,
 {
-    /// When this timer comes due, or `None` for one that never does: one asked for further ahead
-    /// than the clock can name, as `sleep(Duration::MAX)` is.
+    /// When this timer comes due, or `None` if it never does, because its deadline is too far ahead
+    /// for the clock to represent, as for `sleep(Duration::MAX)`.
     pub fn deadline(&self) -> Option<Instant> {
         self.0.deadline()
     }
 
-    /// Moves this timer to `deadline`, in place: what a keep-alive or an idle timeout needs, which
-    /// pushes its deadline back on every message rather than making a fresh timer for each.
+    /// Moves this timer to `deadline`, in place.
+    ///
+    /// Use this for a keep-alive or an idle timeout, which pushes its deadline back on every
+    /// message rather than creating a new timer for each.
     ///
     /// The timer completes once `deadline` has passed, whether or not it was polled before the
-    /// reset, and whether or not it had already completed: one that has completes again at its
-    /// new deadline, so it can be awaited again. A task already waiting on the timer is woken at
-    /// the new deadline without polling the timer again, so the part of a task that resets a timer
-    /// need not be the part that awaits it. That takes a deadline before the reset as well as
-    /// after it: a timer that had none, as one made by `sleep(Duration::MAX)` has none, takes its
-    /// new deadline on its next poll, and a task waiting on it is not woken to make that poll.
+    /// reset, and whether or not it had already completed. A timer that had completed completes
+    /// again at its new deadline, so it can be awaited again. A task already waiting on the timer
+    /// is woken at the new deadline without polling the timer again, so the code that resets a
+    /// timer need not be the code that awaits it. That needs the timer to have had a deadline
+    /// before the reset, though. A timer that had none, such as one from `sleep(Duration::MAX)`,
+    /// only takes its new deadline on its next poll, and a task waiting on it is not woken for that
+    /// poll.
     ///
-    /// A pinned timer, in a `pin!` or behind a `Pin<&mut Sleep>`, is reset all the same: a timer
-    /// is `Unpin`.
+    /// A timer is `Unpin`, so a pinned timer, in a `pin!` or behind a `Pin<&mut Sleep>`, can be
+    /// reset too.
     ///
     /// # Example
     ///
@@ -383,9 +377,10 @@ where
         self.0.reset(Some(deadline));
     }
 
-    /// Moves this timer to `duration` from now, in place, as [`reset`](Self::reset) does: a length
-    /// of time further ahead than the clock can name, as `Duration::MAX` is, makes it a timer that
-    /// never comes due.
+    /// Moves this timer to `duration` from now, in place, as [`reset`](Self::reset) does.
+    ///
+    /// A `duration` too long for the clock to represent, such as `Duration::MAX`, makes it a timer
+    /// that never comes due.
     ///
     /// # Example
     ///

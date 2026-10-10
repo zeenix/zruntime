@@ -32,60 +32,62 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mode, reactor};
 
-/// The async counterpart of a non-blocking I/O handle, as smol has in `smol::Async`.
+/// An async I/O handle: a source that the runtime watches for readiness. Like `smol::Async`.
 ///
-/// It wraps a source the runtime can watch for readiness, and runs I/O on it without blocking the
-/// thread: an operation that would block waits for the runtime to report the source ready instead,
-/// leaving the thread to the other tasks in the meantime. On unix the source is anything with a
-/// file descriptor: a pipe, a terminal, an eventfd, an inotify instance, the standard I/O of a
-/// child process, or a socket of a type the `net` module has none for. On Windows it is a socket,
-/// and nothing else, as that is all the runtime's `select` can watch there. The handle also serves
-/// to give a descriptor to another library that does its own I/O: [`readable`](AsyncIo::readable)
-/// and [`writable`](AsyncIo::writable) wait for the readiness that library's operation needs, with
-/// no operation of their own.
+/// It runs I/O on the source without blocking the thread. An operation that would block waits for
+/// the runtime to report the source ready instead, and the thread runs other tasks in the meantime.
 ///
-/// The handle runs on the runtime given to the constructor that made it, whose reactor watches
-/// the source from then on. Its operations make progress while some thread is inside
-/// [`Runtime::block_on`] on that runtime, or, on a runtime from `SharedRuntime::current`, while
-/// the helper thread runs it. The handle's type carries the flavour of that runtime: one built on
-/// a [`LocalRuntime`](crate::LocalRuntime) is an `AsyncIo<T, Local>`, [`Local`] being
-/// the default, and stays on the thread it was made on; one built on a
-/// [`SharedRuntime`](crate::SharedRuntime) is an `AsyncIo<T, Shared>`, which may be sent to, and
-/// used from, any thread. A shared runtime watches only a source that is `Send` and `Sync`, as
-/// [`Source`] says.
+/// On unix, the source can be anything with a file descriptor: a pipe, a terminal, an eventfd, an
+/// inotify instance, the standard I/O of a child process, or a socket type that the `net` module
+/// does not cover. On Windows, it can only be a socket, because that is all the runtime's `select`
+/// can watch there. [`readable`](AsyncIo::readable) and [`writable`](AsyncIo::writable) only wait
+/// for readiness, for a descriptor that another library does the I/O on.
+///
+/// The handle uses the runtime passed to its constructor, which watches the source from then on.
+/// Its operations make progress while a thread is running [`Runtime::block_on`] on that runtime,
+/// or, on a runtime from `SharedRuntime::current`, while the helper thread runs it. The type
+/// carries the flavour of the runtime:
+///
+/// * On a [`LocalRuntime`](crate::LocalRuntime), it is an `AsyncIo<T, Local>` ([`Local`] is the
+///   default), and stays on the thread that created it.
+/// * On a [`SharedRuntime`](crate::SharedRuntime), it is an `AsyncIo<T, Shared>`, which can be sent
+///   to and used from any thread. A shared runtime only watches a source that is `Send` and `Sync`,
+///   as [`Source`] says.
 ///
 /// # Waiting
 ///
+/// Any number of tasks can wait at once, in either direction, through
 /// [`readable`](AsyncIo::readable), [`writable`](AsyncIo::writable),
-/// [`read_with`](AsyncIo::read_with) and [`write_with`](AsyncIo::write_with) let any number of
-/// tasks wait at once, in either direction, each through a shared reference to the handle.
+/// [`read_with`](AsyncIo::read_with) and [`write_with`](AsyncIo::write_with). Each needs only a
+/// shared reference to the handle.
 ///
-/// The poll-based [`poll_read_with`](AsyncIo::poll_read_with) and
-/// [`poll_write_with`](AsyncIo::poll_write_with), and the `AsyncRead` and `AsyncWrite`
-/// implementations built on them, keep one waiting task per direction instead: where a second task
-/// waits to read, say, it takes the first one's place, which is then never woken. Tasks that share
-/// a direction through them take turns, behind a lock of their own.
+/// [`poll_read_with`](AsyncIo::poll_read_with), [`poll_write_with`](AsyncIo::poll_write_with), and
+/// the `AsyncRead` and `AsyncWrite` impls built on them, keep only one waiting task per direction.
+/// If a second task waits to read through them, for example, it replaces the first one, which is
+/// then never woken. Tasks that share a direction through them must take turns, for example behind
+/// a lock.
 ///
-/// # The I/O traits
+/// # I/O traits
 ///
-/// `AsyncIo<T, M>` implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
-/// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
-/// `&AsyncIo<T, M>`, which lets a reader and a writer share one handle. Both are there wherever
-/// `&T` implements `Read`, for the first trait, and `Write`, for the second, as it does for
+/// `AsyncIo<T, M>` and `&AsyncIo<T, M>` implement the `AsyncRead` and `AsyncWrite` traits of
+/// [`futures-io`], so the extension traits of [`futures`] work with them. The impls for a shared
+/// reference let a reader and a writer share one handle. `AsyncRead` needs `&T` to implement
+/// `Read`, and `AsyncWrite` needs `&T` to implement `Write`. That is the case for
 /// `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets, `TcpStream` and
-/// `UnixStream`: a listener or a datagram socket implements neither.
+/// `UnixStream`. Listeners and datagram sockets implement neither.
 ///
-/// The source sits behind a pointer that the runtime's reactor shares, so no `&mut T` is ever
-/// handed out. A type that implements `Read` or `Write` only for `&mut self`, such as
-/// `std::process::ChildStdout` and `ChildStdin`, has to be converted first. On unix that is
-/// through `OwnedFd`: a `ChildStdout` becomes a `PipeReader`, and a `ChildStdin` a `PipeWriter`.
-/// With the `process` feature, `zruntime::process` spawns children whose pipes are async already,
-/// so that none of this is needed for them.
+/// The runtime's reactor shares the source, so the handle never gives out a `&mut T`. A type that
+/// only implements `Read` or `Write` for `&mut self`, such as `std::process::ChildStdout` and
+/// `ChildStdin`, must be converted first. On unix, convert it through `OwnedFd`: a `ChildStdout`
+/// into a `PipeReader`, and a `ChildStdin` into a `PipeWriter`. The pipes of children spawned with
+/// `zruntime::process` are async already.
 ///
-/// A regular file is not what this is for. Linux and Android cannot watch one, and a wait on one
-/// fails there; elsewhere one is reported ready whether or not the disk has its data at hand, and
-/// a read of it blocks the thread whatever the mode it is in. `zruntime::Unblock`
-/// and `zruntime::fs` run each operation on a thread of their own instead.
+/// # Regular files
+///
+/// `AsyncIo` is not for regular files. On Linux and Android, the runtime cannot watch one, so
+/// waiting on one fails. Elsewhere, a regular file is always reported ready, and reading it blocks
+/// the thread, whatever its mode. `zruntime::Unblock` and `zruntime::fs` run each operation on a
+/// pool of threads instead.
 ///
 /// # Example
 ///
@@ -134,21 +136,21 @@ impl<T, M> AsyncIo<T, M>
 where
     M: Mode,
 {
-    /// An `AsyncIo` on `runtime` that does its I/O on `io`, which this switches to non-blocking
-    /// mode.
+    /// Creates an `AsyncIo` on `runtime` that does its I/O on `io`, and switches `io` to
+    /// non-blocking mode.
     ///
-    /// On unix the mode belongs to the open file description rather than to a handle on it, so it
-    /// is shared with every duplicate of the descriptor, in this process or in another: the
-    /// standard input, where it is a terminal, is shared with the shell that started the program,
-    /// say, and is left in non-blocking mode for it. A caller that must leave the mode alone for
-    /// them puts the source in non-blocking mode itself, where it knows that is safe, and makes
-    /// the handle with [`new_nonblocking`](AsyncIo::new_nonblocking).
+    /// On unix, the mode belongs to the open file description, not to the descriptor. So every
+    /// duplicate of the descriptor shares it, in this process or another. For example, if the
+    /// standard input is a terminal, the shell that started the program shares it, and is left with
+    /// it in non-blocking mode. If the mode must not change for others, set it yourself where that
+    /// is safe, and use [`new_nonblocking`](AsyncIo::new_nonblocking).
     ///
-    /// What can fail is the switch to non-blocking mode, and the runtime taking the source under
-    /// its watch. A runtime watches a descriptor through one handle at a time, and turns away a
-    /// source whose descriptor it watches already with
-    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches a limited number of
-    /// sockets: at most 1023 at a time, which its reactor waits on in a single `select` call.
+    /// # Errors
+    ///
+    /// Fails if `io` cannot be switched to non-blocking mode, or if the runtime cannot watch it. A
+    /// runtime watches each descriptor through one handle at a time, so this fails with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) if the runtime already watches the
+    /// descriptor of `io`. On Windows, a runtime watches at most 1023 sockets at a time.
     pub fn new(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,
@@ -158,18 +160,20 @@ where
         Self::new_nonblocking(runtime, io)
     }
 
-    /// An `AsyncIo` on `runtime` that does its I/O on `io`, as it is.
+    /// Creates an `AsyncIo` on `runtime` that does its I/O on `io`, which must already be in
+    /// non-blocking mode.
     ///
-    /// `io` must be in non-blocking mode already, which is the caller's to see to: each operation
-    /// is tried on the source at once, and waits for readiness only once it reports
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), so an operation on a blocking source with nothing
-    /// ready would hold up the thread it runs on, and every other task with it.
+    /// Making sure of that is up to the caller. Each operation runs on the source right away, and
+    /// only waits for readiness if it fails with [`WouldBlock`](io::ErrorKind::WouldBlock). On a
+    /// blocking source, an operation with nothing ready blocks the thread instead, and every other
+    /// task with it.
     ///
-    /// What can fail is the runtime taking the source under its watch. A runtime watches a
-    /// descriptor through one handle at a time, and turns away a source whose descriptor it
-    /// watches already with [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches
-    /// a limited number of sockets: at most 1023 at a time, which its reactor waits on in a single
-    /// `select` call.
+    /// # Errors
+    ///
+    /// Fails if the runtime cannot watch `io`. A runtime watches each descriptor through one handle
+    /// at a time, so this fails with [`AlreadyExists`](io::ErrorKind::AlreadyExists) if the runtime
+    /// already watches the descriptor of `io`. On Windows, a runtime watches at most 1023 sockets
+    /// at a time.
     pub fn new_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,
@@ -191,10 +195,10 @@ where
         &self.io
     }
 
-    /// Stops watching the source, and hands it back, still in non-blocking mode.
+    /// Stops watching the source, and returns it, still in non-blocking mode.
     ///
-    /// On a shared runtime this may wait for a moment, while a thread driving the runtime returns
-    /// from a wait that watched the source.
+    /// On a shared runtime, this may block for a moment, until a thread running the runtime returns
+    /// from a wait that watches the source.
     pub fn into_inner(self) -> T {
         let Self { registration, io } = self;
         // The watch ends first: nothing the reactor holds is left to share the source then, but
@@ -204,46 +208,49 @@ where
         M::into_inner(io)
     }
 
-    /// A future that completes once the source is ready to be read from, without running any
-    /// operation on it.
+    /// Waits until the source is readable, without running any operation on it.
     ///
-    /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
-    /// task may take the bytes before this one gets to them, so an operation run after the wait
-    /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`read_with`](AsyncIo::read_with) does. The wait fails where the runtime cannot
-    /// start to watch the source, which the system's poller may refuse to. See
-    /// [`Registration::ready`] for what the wait is.
+    /// Any number of tasks can wait at once. Readiness is only a hint: another task may take the
+    /// bytes first. So an operation run after the wait must still expect
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), and wait again when it gets one, as
+    /// [`read_with`](AsyncIo::read_with) does. See [`Registration::ready`] for details.
+    ///
+    /// # Errors
+    ///
+    /// The wait fails if the OS refuses to watch the source.
     pub fn readable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Readable)
     }
 
-    /// A future that completes once the source is ready to be written to, without running any
-    /// operation on it.
+    /// Waits until the source is writable, without running any operation on it.
     ///
-    /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
-    /// task may take the room before this one gets to it, so an operation run after the wait
-    /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`write_with`](AsyncIo::write_with) does. The wait fails where the runtime
-    /// cannot start to watch the source, which the system's poller may refuse to. See
-    /// [`Registration::ready`] for what the wait is.
+    /// Any number of tasks can wait at once. Readiness is only a hint: another task may take the
+    /// room first. So an operation run after the wait must still expect
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), and wait again when it gets one, as
+    /// [`write_with`](AsyncIo::write_with) does. See [`Registration::ready`] for details.
+    ///
+    /// # Errors
+    ///
+    /// The wait fails if the OS refuses to watch the source.
     pub fn writable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Writable)
     }
 
-    /// Runs `operation` on the source until it no longer reports
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the source to be readable in
-    /// between.
+    /// Runs `operation` on the source until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the source to be readable in between.
     ///
-    /// Resolves to the first success `operation` returns, and to the first error other than
-    /// `WouldBlock`, or to the error of a wait for readiness, as [`readable`](AsyncIo::readable)
-    /// says. A call the kernel interrupted is made again straight away.
+    /// Returns the first success of `operation`, or its first error other than `WouldBlock`. Also
+    /// fails if a wait for readiness fails, as for [`readable`](AsyncIo::readable). A call that
+    /// fails with [`Interrupted`](io::ErrorKind::Interrupted) is retried right away.
     ///
-    /// `operation` must not block: the source is in non-blocking mode so that a call on it
-    /// returns at once, and `operation` runs on the thread that every task of the runtime shares.
+    /// `operation` must not block. It runs on the thread that all tasks of the runtime share.
     ///
-    /// Any number of tasks may do this at once, on one handle. Dropping the future gives up the
-    /// wait, and leaves no operation half done: each call of `operation` runs to its end before
-    /// the future can be dropped.
+    /// Any number of tasks can do this at once on one handle.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done: each call of
+    /// `operation` runs to its end before the future can be dropped.
     pub async fn read_with<R>(
         &self,
         mut operation: impl FnMut(&T) -> io::Result<R>,
@@ -260,21 +267,22 @@ where
         }
     }
 
-    /// Runs `operation` on the source until it no longer reports
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the source to be writable in
-    /// between.
+    /// Runs `operation` on the source until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the source to be writable in between.
     ///
-    /// Resolves to the first success `operation` returns, a partial write included, and to the
-    /// first error other than `WouldBlock`, or to the error of a wait for readiness, as
-    /// [`writable`](AsyncIo::writable) says. A call the kernel interrupted is made again straight
-    /// away.
+    /// Returns the first success of `operation`, a partial write included, or its first error other
+    /// than `WouldBlock`. Also fails if a wait for readiness fails, as for
+    /// [`writable`](AsyncIo::writable). A call that fails with
+    /// [`Interrupted`](io::ErrorKind::Interrupted) is retried right away.
     ///
-    /// `operation` must not block: the source is in non-blocking mode so that a call on it
-    /// returns at once, and `operation` runs on the thread that every task of the runtime shares.
+    /// `operation` must not block. It runs on the thread that all tasks of the runtime share.
     ///
-    /// Any number of tasks may do this at once, on one handle. Dropping the future gives up the
-    /// wait, and leaves no operation half done: each call of `operation` runs to its end before
-    /// the future can be dropped.
+    /// Any number of tasks can do this at once on one handle.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done: each call of
+    /// `operation` runs to its end before the future can be dropped.
     pub async fn write_with<R>(
         &self,
         mut operation: impl FnMut(&T) -> io::Result<R>,
@@ -291,15 +299,15 @@ where
         }
     }
 
-    /// [`read_with`](AsyncIo::read_with), polled: what an implementation of a poll-based trait runs
-    /// its read through.
+    /// The polling version of [`read_with`](AsyncIo::read_with), for implementing poll-based
+    /// traits.
     ///
-    /// Runs `operation` on the source, and where it reports
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), arranges for `cx`'s waker to be woken once the
-    /// source is readable and returns [`Poll::Pending`].
+    /// Runs `operation` on the source. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the source is readable, and returns
+    /// [`Poll::Pending`].
     ///
-    /// Unlike `read_with`, this keeps one waiting task for reading: a second one waiting takes
-    /// the first one's place, which is then never woken. See [`Registration::poll_io`].
+    /// Unlike `read_with`, this keeps only one waiting task for reading. A second task that waits
+    /// replaces the first one, which is then never woken. See [`Registration::poll_io`].
     pub fn poll_read_with<R>(
         &self,
         cx: &mut Context<'_>,
@@ -308,15 +316,15 @@ where
         self.poll_io(cx, Interest::Readable, operation)
     }
 
-    /// [`write_with`](AsyncIo::write_with), polled: what an implementation of a poll-based trait
-    /// runs its write through.
+    /// The polling version of [`write_with`](AsyncIo::write_with), for implementing poll-based
+    /// traits.
     ///
-    /// Runs `operation` on the source, and where it reports
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), arranges for `cx`'s waker to be woken once the
-    /// source is writable and returns [`Poll::Pending`].
+    /// Runs `operation` on the source. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the source is writable, and returns
+    /// [`Poll::Pending`].
     ///
-    /// Unlike `write_with`, this keeps one waiting task for writing: a second one waiting takes
-    /// the first one's place, which is then never woken. See [`Registration::poll_io`].
+    /// Unlike `write_with`, this keeps only one waiting task for writing. A second task that waits
+    /// replaces the first one, which is then never woken. See [`Registration::poll_io`].
     pub fn poll_write_with<R>(
         &self,
         cx: &mut Context<'_>,

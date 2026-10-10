@@ -290,10 +290,9 @@ where
     }
 }
 
-/// A source a [`Runtime`](crate::Runtime) watches, and what its owner does its I/O through.
+/// A source that a [`Runtime`](crate::Runtime) watches, and the handle to do its I/O through.
 ///
-/// A registration holds its runtime, so a task holding one keeps that runtime alive: nothing
-/// here takes a runtime down while it has work.
+/// A registration holds its runtime, so a task that holds one keeps the runtime alive.
 pub struct Registration<M = Local>
 where
     M: Mode,
@@ -315,26 +314,25 @@ impl<M> Registration<M>
 where
     M: Mode,
 {
-    /// Runs `operation` while this registration's source is ready for `interest`, retrying it as
-    /// new readiness arrives.
+    /// Runs `operation` while the source of this registration is ready for `interest`, and retries
+    /// it when new readiness arrives.
     ///
-    /// The first success `operation` returns, a partial write included, and the first error
-    /// other than [`WouldBlock`](io::ErrorKind::WouldBlock) are each what this call resolves to.
-    /// A `WouldBlock` means the source was not ready after all: `cx`'s waker is arranged to be
-    /// woken once it is, and [`Poll::Pending`] is returned. Where the runtime fails to start
-    /// watching the source for `interest` then, which the system's poller may refuse to, the call
-    /// resolves to that error instead.
+    /// Returns the first success of `operation`, a partial write included, or its first error other
+    /// than [`WouldBlock`](io::ErrorKind::WouldBlock). A `WouldBlock` means the source was not
+    /// ready after all. In that case, this arranges for the waker of `cx` to be woken once it is,
+    /// and returns [`Poll::Pending`]. If the OS then refuses to watch the source for `interest`,
+    /// this returns that error instead.
     ///
-    /// A registration keeps one waker per interest for this, so only one operation at a time may
-    /// be waiting on each: a second one waiting to read, say, takes the first one's place, which
-    /// is then never woken. One reader and one writer waiting together is fine; more of either
-    /// have to take turns, behind a lock of their own, or wait through
-    /// [`ready`](Registration::ready), which any number of tasks may do at once, and run their
+    /// A registration keeps one waker per interest for this, so only one operation at a time can
+    /// wait in each direction. If a second operation waits to read, for example, it replaces the
+    /// first one, which is then never woken. One reader and one writer can wait together. More of
+    /// either must take turns, for example behind a lock, or wait through
+    /// [`ready`](Registration::ready), which any number of tasks can do at once, and run their
     /// operation once it completes.
     ///
-    /// Never spins while the source is not ready and, the source being nonblocking as
-    /// [`Runtime::register`](crate::Runtime#method.register) requires, never blocks the calling
-    /// thread.
+    /// This never spins while the source is not ready. Since the source is non-blocking, as
+    /// [`Runtime::register`](crate::Runtime#method.register) requires, it never blocks the thread
+    /// either.
     pub fn poll_io<T>(
         &self,
         cx: &mut Context<'_>,
@@ -385,26 +383,28 @@ where
         Poll::Pending
     }
 
-    /// Waits until this registration's source is ready for `interest`, without running any
+    /// Waits until the source of this registration is ready for `interest`, without running any
     /// operation on it.
     ///
-    /// What a caller that does its I/O some other way waits on: through a library it hands the
-    /// source to, say, or with an operation it would rather run once, after the wait, than on
-    /// every poll. The wait completes once the runtime finds the source ready for `interest`, or
-    /// once a wait of the runtime fails, and never otherwise: its first poll only stores its
-    /// waker, and a poll the source did not cause, as when the future shares a task with others,
-    /// leaves it waiting. It fails, on its first poll, where the runtime cannot start to watch the
-    /// source for `interest`, which the system's poller may refuse to.
+    /// Use this for I/O done some other way: through a library that the source is handed to, for
+    /// example, or with an operation that should run once after the wait rather than on every poll.
     ///
-    /// Any number of these may wait at once, on one source and in one direction, alongside an
-    /// operation of [`poll_io`](Registration::poll_io), and the readiness wakes them all.
-    /// Dropping one gives up its wait.
+    /// The wait completes once the runtime finds the source ready for `interest`, or once a wait of
+    /// the runtime fails. Nothing else completes it. Its first poll only stores the waker, and a
+    /// poll for any other reason, such as another future in the same task, leaves it waiting.
     ///
-    /// Readiness is a hint rather than a promise: another task may take the bytes, or the room,
-    /// before this one gets to them, and a wait of the runtime that fails ends every wait for
-    /// readiness, so that each waiter tries its operation and sees the outcome for itself. An
-    /// operation run once this completes still has to expect
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it gets one.
+    /// Any number of these can wait at once, on one source and in one direction, alongside an
+    /// operation of [`poll_io`](Registration::poll_io). Readiness wakes them all. Dropping one
+    /// gives up its wait.
+    ///
+    /// Readiness is only a hint: another task may take the bytes, or the room, first. A failed wait
+    /// of the runtime also ends every wait for readiness, so that each waiter tries its operation
+    /// and sees the result for itself. So an operation run after this completes must still expect
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), and wait again when it gets one.
+    ///
+    /// # Errors
+    ///
+    /// Fails on its first poll if the OS refuses to watch the source for `interest`.
     pub fn ready(&self, interest: Interest) -> Readiness<'_, M> {
         Readiness {
             registration: self,
@@ -481,12 +481,12 @@ where
     }
 }
 
-/// A wait for a registered source to be ready for an [`Interest`], which
-/// [`Registration::ready`] hands out.
+/// A wait for a registered source to be ready for an [`Interest`], returned by
+/// [`Registration::ready`].
 ///
-/// The future completes once the runtime finds the source ready, or once a wait of the runtime
-/// fails, and dropping it before then gives up the wait. It fails where the runtime cannot start
-/// to watch the source for the interest, which its first poll finds out.
+/// It completes once the runtime finds the source ready, or once a wait of the runtime fails.
+/// Dropping it before then gives up the wait. It fails on its first poll if the OS refuses to watch
+/// the source for the interest.
 #[must_use = "futures do nothing unless polled"]
 pub struct Readiness<'a, M = Local>
 where
