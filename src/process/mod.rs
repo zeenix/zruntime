@@ -1,85 +1,99 @@
 //! Async child processes on a [`Runtime`].
 //!
-//! The module has the shape of [`std::process`], and of `smol::process` of the async-process crate.
-//! A [`Command`] builds the process to spawn, and the [`Child`] it spawns has the pipes to the
-//! process, [`ChildStdin`], [`ChildStdout`] and [`ChildStderr`], to write to and read from, and
-//! futures that wait for the process to exit or to hand over everything it wrote. None of them
-//! blocks the thread: where one has to wait, the thread is left to the other tasks in the
-//! meantime.
+//! The API has the shape of [`std::process`], like `smol::process`. A [`Command`] builds the
+//! process to spawn. The [`Child`] it spawns holds the pipes to the process, [`ChildStdin`],
+//! [`ChildStdout`] and [`ChildStderr`], and has futures that wait for the process to exit. Nothing
+//! here blocks the thread: when an operation has to wait, the thread can run other tasks.
 //!
 //! The pipes implement the `AsyncWrite` and `AsyncRead` traits of [`futures-io`], so the extension
-//! traits of [`futures`] write to and read from them.
+//! traits of [`futures`] work on them.
 //!
 //! # The runtime
 //!
 //! A child is spawned on a runtime, which [`Command::spawn`], [`Command::status`] and
-//! [`Command::output`] take as an argument. On unix that runtime's reactor watches the pipes to the
-//! child from then on: their operations make progress while some thread is inside
-//! [`Runtime::block_on`] on that runtime, or, on a runtime from `SharedRuntime::current`, while the
-//! helper thread runs it. On Linux, on Apple's platforms and on the BSDs the reactor watches for
-//! the exit of the process as well, and a wait for it makes progress in the same way. On Windows,
-//! where the reactor cannot watch a pipe, each read from and write to one runs as blocking work on
-//! a thread of the pool of [`unblock()`](crate::unblock()), and makes progress with no thread
-//! inside `block_on` at all. So does a wait for a process to exit where the reactor does not watch
-//! for that, which runs as blocking work on a pool of its own: see
-//! [waiting for a child](self#waiting-for-a-child).
+//! [`Command::output`] take as an argument.
 //!
-//! The types carry the flavour of the runtime, on every platform. A child spawned on a
-//! [`LocalRuntime`] is a `Child<Local>`, `Local` being the default, and stays on the thread it was
-//! made on, with its pipes; one spawned on a [`SharedRuntime`] is a `Child<Shared>`, which may be
-//! sent to, and used from, any thread.
+//! On unix, the runtime's reactor watches the pipes to the child. Reads and writes make progress
+//! while a thread is running [`Runtime::block_on`] on that runtime. They also make progress while
+//! the helper thread runs the runtime, as it does for one from `SharedRuntime::current`. On Linux
+//! (with pidfd support), on Apple's platforms and on the BSDs, the reactor also watches for the
+//! process to exit, so a wait for the exit makes progress in the same way.
+//!
+//! On Windows, the reactor cannot watch a pipe. Each read from and write to a pipe runs as blocking
+//! work on a thread of the pool of [`unblock()`](crate::unblock()), so it makes progress even
+//! while no thread is running `block_on`. The same holds for a wait for the exit on any platform
+//! where the reactor cannot watch for it, which includes Windows. That wait runs on a pool of its
+//! own: see [waiting for a child](self#waiting-for-a-child).
+//!
+//! `Child` and the pipes are generic over the runtime's flavour, on every platform. A child spawned
+//! on a [`LocalRuntime`] is a `Child<Local>` (`Local` is the default). It stays on the thread that
+//! created it, with its pipes. A child spawned on a [`SharedRuntime`] is a `Child<Shared>`, which
+//! can be sent to and used from any thread.
 //!
 //! # Waiting for a child
 //!
-//! [`Child::status`] and [`Child::output`] resolve to the exit status once the process has exited.
-//! A process that has exited stays in the system's process table, as a zombie that holds on to its
-//! process ID, until its status is collected. Resolving a status does that, and so does
-//! [`Child::try_status`], which never waits.
+//! [`Child::status`] waits for the process to exit and resolves to its exit status.
+//! [`Child::output`] does the same after it has read the output pipes.
 //!
-//! Where the runtime can watch for a process to exit, it does, and the wait holds no thread. On
-//! Linux that is through a pidfd, a descriptor of the process that turns readable once the process
-//! has exited. On Apple's platforms and the BSDs it is through a kqueue of the child's own, with a
-//! filter on the process, whose descriptor turns readable in the same way. The reactor watches
-//! the descriptor as it does a pipe, from the spawn of the process until the descriptor has
-//! reported the exit. A wait that is given up on leaves nothing running. A kqueue that cannot be
-//! made, for want of descriptors, say, fails the spawn with the error on Apple's platforms and the
-//! BSDs, as a pipe that cannot be made does: there is no wait on the pool to fall back on. On
-//! Linux, a process that another process traces is held back by its tracer after its exit, for as
-//! long as the tracer takes to let it go: a wait that finds it so goes on on the pool.
+//! On unix, a process that has exited stays in the process table as a zombie, and keeps its
+//! process ID, until its status is collected. [`Child::status`] collects the status when it
+//! resolves, and so does [`Child::try_status`], which never waits.
 //!
-//! Where the runtime cannot watch for the exit, which is on Android, on Windows, on the other unix
-//! systems, and on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose
-//! sandbox turns the call away, the wait runs as blocking work on a thread of a pool kept for the
-//! waits for children, which is held until the process has exited. It is started by the first wait
-//! that finds the process still running, rather than by spawning, so a child that nobody waits for
-//! holds none. Dropping the future of a wait gives up the wait but not that thread: the next wait
-//! for the same child takes it up where it was, so that waits given up on do not pile up threads.
+//! If the runtime can watch for the exit, the wait holds no thread:
 //!
-//! That pool is the one that a dropped child is [reaped](self#dropping-a-child) on as well, and not
-//! the one of [`unblock()`](crate::unblock()), which a program that waits for many long-running
-//! children at once would otherwise fill, for all its other blocking work to wait behind.
+//! - On Linux, the runtime watches a pidfd, a descriptor of the process that becomes readable when
+//!   the process exits.
+//! - On Apple's platforms and the BSDs, it watches a kqueue that belongs to the child alone, with a
+//!   filter on the process. The descriptor of the queue becomes readable when the process exits.
+//!
+//! The reactor watches the descriptor like a pipe, from the spawn until it reports the exit.
+//! Dropping the future of a wait leaves nothing running.
+//!
+//! On Apple's platforms and the BSDs, there is no other way to wait. If the kqueue cannot be
+//! created, for example because the process is out of descriptors, the spawn fails with that
+//! error, as it does if a pipe cannot be created. On Linux, a process that another process traces
+//! cannot be collected after it exits until its tracer lets it go. A wait that finds the process in
+//! that state continues on the pool described next.
+//!
+//! The runtime cannot watch for the exit on Android, on Windows, on other unix systems, and on a
+//! Linux without pidfd support (before 5.3, or in a sandbox that rejects the call). There, the wait
+//! runs as blocking work on a thread of a pool kept for waits for children, and holds that thread
+//! until the process exits. The first wait that finds the process still running starts the work.
+//! Spawning does not, so a child that nobody waits for holds no thread. Dropping the future of a
+//! wait gives up the wait but not the thread. The next wait for the same child takes it up where it
+//! left off, so abandoned waits do not pile up threads.
+//!
+//! The pool is separate from the one behind [`unblock()`](crate::unblock()). Otherwise a program
+//! that waits for many long-running children at once would fill that pool, and all its other
+//! blocking work would wait behind them. A [dropped child](self#dropping-a-child) is collected on
+//! the same pool.
 //!
 //! # Dropping a child
 //!
-//! Dropping a [`Child`] closes its pipes, and leaves the process running, as dropping a std `Child`
-//! does. [`Command::kill_on_drop`] has the process killed instead. A process that exits with
-//! nobody to collect its status stays a zombie, and std's `Child` leaves it so. On unix, a `Child`
-//! dropped while its process runs hands the process over to a thread of a pool kept for the waits
-//! for children instead, which collects its status once it has exited, unless
-//! [`Command::reap_on_drop`] says not to. That thread is held until the process exits, so a
-//! program that lets go of many processes that run for long holds as many threads. The pool has
-//! room for 500, past which a process that is let go of waits its turn behind the others, and stays
-//! a zombie should it exit before a thread is free to collect it. Its threads are named
-//! `zruntime child wait`, and it is apart from the pool of [`unblock()`](crate::unblock()), which
-//! every other piece of blocking work of the process shares, that of the `fs` module among it:
-//! however many processes are let go of, and however long they run, that work never waits behind
-//! them. Killing them, waiting for them, or turning `reap_on_drop` off keeps the threads from being
-//! held for long. Windows leaves no zombie, so there is nothing to collect there, and
-//! `reap_on_drop` does nothing.
+//! Dropping a [`Child`] closes the pipes it still holds. It leaves the process running, as
+//! dropping a std `Child` does. [`Command::kill_on_drop`] kills the process instead.
+//!
+//! On unix, a process that exits with nobody to collect its status stays a zombie, and std's
+//! `Child` leaves it so. By default, a `Child` that is dropped while its process is running hands
+//! the process to a thread of the pool for waits for children. That thread waits for the process
+//! to exit and collects its status. [`Command::reap_on_drop`] turns this off.
+//!
+//! Each such thread is held until its process exits, so dropping many long-running children holds
+//! as many threads. The pool has room for 500 threads. Beyond that, a dropped child waits for a
+//! free thread, and stays a zombie if it exits before one is free. Killing the processes, waiting
+//! for them, or turning `reap_on_drop` off keeps threads from being held for long.
+//!
+//! The threads are named `zruntime child wait`. The pool is separate from the one behind
+//! [`unblock()`](crate::unblock()), which all other blocking work shares, including the `fs`
+//! module. However many children are dropped, and however long they run, that work never waits
+//! behind them.
+//!
+//! Windows leaves no zombie, so there is nothing to collect there, and `reap_on_drop` does
+//! nothing.
 //!
 //! # Example
 //!
-//! The output of a command, run on a local runtime:
+//! Runs a command on a local runtime and checks its output:
 //!
 //! ```
 //! # #[cfg(unix)]
@@ -128,37 +142,36 @@ use crate::{
 };
 pub use std::process::{ExitStatus, Output, Stdio};
 
-/// A builder of a process to spawn, as [`std::process::Command`] is, whose methods that spawn it
-/// take the runtime to spawn it on.
+/// A builder for a process to spawn, like [`std::process::Command`].
 ///
-/// The command is configured as std's is: with its arguments, its environment, its working
-/// directory, and what the standard streams of the process are connected to. A command built
-/// with `Command::new` starts from the environment and working directory of this process, and
-/// [`as_std`](Command::as_std) gives the std command inside for what only that has: the getters
-/// of the program, the arguments, the environment and the working directory, and, through
-/// [`as_std_mut`](Command::as_std_mut), the extension traits of the platform, such as std's
-/// `CommandExt` of unix.
+/// The methods that spawn the process take the runtime to spawn it on. Configure the command as
+/// with std: its arguments, environment, working directory and the standard streams of the
+/// process. A command from `Command::new` starts with the environment and working directory of
+/// this process.
 ///
-/// What becomes of the process when its [`Child`] is dropped is this builder's own, which std's
-/// command knows nothing of: [`kill_on_drop`](Command::kill_on_drop) and
-/// [`reap_on_drop`](Command::reap_on_drop) set it, and its own getters,
+/// [`as_std`](Command::as_std) gives the std command inside, for its getters of the program, the
+/// arguments, the environment and the working directory.
+/// [`as_std_mut`](Command::as_std_mut) gives it for the extension traits of the platform, such as
+/// std's `CommandExt` on unix.
+///
+/// What happens to the process when its [`Child`] is dropped is set on this builder, not on the
+/// std command. [`kill_on_drop`](Command::kill_on_drop) and
+/// [`reap_on_drop`](Command::reap_on_drop) set it, and
 /// [`get_kill_on_drop`](Command::get_kill_on_drop) and
-/// [`get_reap_on_drop`](Command::get_reap_on_drop), read it back.
+/// [`get_reap_on_drop`](Command::get_reap_on_drop) read it.
 ///
-/// A command may be spawned any number of times. The standard streams that this builder was not
-/// told about are decided by the method that runs the command, afresh each time:
-/// [`spawn`](Command::spawn) and [`status`](Command::status) inherit them from this process, and
-/// [`output`](Command::output) connects the standard input to nothing and the other two to pipes,
-/// which it reads to their ends. So one command may be run by one of them after another, each
-/// finding the streams as it expects.
+/// A command can run more than once. A standard stream that was not configured gets the default of
+/// the method that runs the command, afresh on each run. [`spawn`](Command::spawn) and
+/// [`status`](Command::status) inherit it from this process. [`output`](Command::output) connects
+/// the standard input to nothing and the other two streams to pipes, which it reads to their ends.
 ///
-/// The process is spawned by the call of `spawn`, `status` or `output` itself, before anything is
-/// polled, and runs from then on: the futures of `status` and `output` only wait for it. A spawn
-/// that fails is reported by the call of `spawn`, and by the future of the other two.
+/// `spawn`, `status` and `output` start the process when they are called, before any future is
+/// polled, and it runs from then on. The futures of `status` and `output` only wait for it. If the
+/// spawn fails, `spawn` returns the error, and the other two resolve to it.
 ///
 /// # Example
 ///
-/// The exit status of a command, with its output left to this process's own:
+/// Runs a command and checks its exit status. Its output goes to this process's own:
 ///
 /// ```
 /// # #[cfg(unix)]
@@ -188,11 +201,11 @@ pub struct Command {
 }
 
 impl Command {
-    /// A command that runs `program`, with no arguments, the environment and working directory of
-    /// this process, and none of the standard streams configured.
+    /// Creates a command that runs `program`.
     ///
-    /// A `program` that has no path in it is looked for on the `PATH` of the process, as std's
-    /// [`Command::new`](std::process::Command::new) says.
+    /// The command has no arguments, inherits the environment and working directory of this
+    /// process, and has no standard streams configured. If `program` has no path in it, it is
+    /// looked up on the `PATH`, as for std's [`Command::new`](std::process::Command::new).
     pub fn new<S>(program: S) -> Self
     where
         S: AsRef<OsStr>,
@@ -221,8 +234,8 @@ impl Command {
 
     /// Sets an environment variable of the process.
     ///
-    /// Names of environment variables are case-insensitive, though case-preserving, on Windows,
-    /// and case-sensitive on every other platform.
+    /// On Windows, names of environment variables are case-insensitive but case-preserving. On
+    /// other platforms, they are case-sensitive.
     pub fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
     where
         K: AsRef<OsStr>,
@@ -243,8 +256,8 @@ impl Command {
         self
     }
 
-    /// Removes an environment variable from the environment of the process, whether this process
-    /// has it or the command set it.
+    /// Removes an environment variable from the environment of the process, whether it is inherited
+    /// from this process or was set on the command.
     pub fn env_remove<K>(&mut self, key: K) -> &mut Self
     where
         K: AsRef<OsStr>,
@@ -253,7 +266,7 @@ impl Command {
         self
     }
 
-    /// Clears the environment of the process, which then has none of this process's variables.
+    /// Clears the environment of the process, so that it inherits none of this process's variables.
     pub fn env_clear(&mut self) -> &mut Self {
         self.inner.env_clear();
         self
@@ -270,7 +283,7 @@ impl Command {
 
     /// Configures what the standard input of the process is connected to.
     ///
-    /// With `Stdio::piped()`, the child's [`stdin`](Child::stdin) is the pipe to it.
+    /// With `Stdio::piped()`, the child's [`stdin`](Child::stdin) is the pipe to the process.
     pub fn stdin<T>(&mut self, cfg: T) -> &mut Self
     where
         T: Into<Stdio>,
@@ -282,7 +295,7 @@ impl Command {
 
     /// Configures what the standard output of the process is connected to.
     ///
-    /// With `Stdio::piped()`, the child's [`stdout`](Child::stdout) is the pipe from it.
+    /// With `Stdio::piped()`, the child's [`stdout`](Child::stdout) is the pipe from the process.
     pub fn stdout<T>(&mut self, cfg: T) -> &mut Self
     where
         T: Into<Stdio>,
@@ -294,7 +307,7 @@ impl Command {
 
     /// Configures what the standard error of the process is connected to.
     ///
-    /// With `Stdio::piped()`, the child's [`stderr`](Child::stderr) is the pipe from it.
+    /// With `Stdio::piped()`, the child's [`stderr`](Child::stderr) is the pipe from the process.
     pub fn stderr<T>(&mut self, cfg: T) -> &mut Self
     where
         T: Into<Stdio>,
@@ -304,87 +317,90 @@ impl Command {
         self
     }
 
-    /// Sets whether the process is killed when its [`Child`] is dropped, which it is not by
-    /// default.
+    /// Sets whether the process is killed when its [`Child`] is dropped.
     ///
-    /// Without it, dropping the `Child` leaves the process running: see the
-    /// [module documentation](self#dropping-a-child). A process killed this way is waited for
-    /// like any other that is let go of, which `reap_on_drop` can turn off.
+    /// The default is `false`: dropping the `Child` leaves the process running. See the
+    /// [module documentation](self#dropping-a-child). The status of a killed process is collected
+    /// like that of any other dropped process, unless [`reap_on_drop`](Command::reap_on_drop) is
+    /// off.
     pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
         self.kill_on_drop = kill_on_drop;
         self
     }
 
-    /// Sets whether the status of the process is collected for the [`Child`], once it exits, when
-    /// the `Child` is dropped while the process runs, which it is by default.
+    /// Sets whether the status of the process is collected when its [`Child`] is dropped while the
+    /// process is still running.
     ///
-    /// A process that exits with nobody to collect its status stays a zombie, which holds on to its
-    /// process ID, until something collects it. With this on, dropping a `Child` on unix hands a
-    /// process that is still running to a thread of a pool kept for the waits for children, which
-    /// waits for it to exit and collects the status. That is a thread held until the process exits,
-    /// which turning this off spares, at the price of the zombie: see the
-    /// [module documentation](self#dropping-a-child).
+    /// The default is `true`. On unix, a process that exits with nobody to collect its status stays
+    /// a zombie and keeps its process ID. With this on, dropping a running `Child` hands the
+    /// process to a thread of a pool for waits for children. The thread waits for the process to
+    /// exit and collects its status, and is held until then. Turning this off spares the thread but
+    /// leaves the zombie: see the [module documentation](self#dropping-a-child).
     ///
-    /// This does nothing on Windows, where a process that exits leaves nothing to collect.
+    /// This does nothing on Windows, where an exited process leaves nothing to collect.
     pub fn reap_on_drop(&mut self, reap_on_drop: bool) -> &mut Self {
         self.reap_on_drop = reap_on_drop;
         self
     }
 
-    /// Whether the process is killed when its [`Child`] is dropped, which it is not by default.
+    /// Whether the process is killed when its [`Child`] is dropped.
     ///
-    /// [`kill_on_drop`](Command::kill_on_drop) sets it.
+    /// The default is `false`. [`kill_on_drop`](Command::kill_on_drop) sets it.
     pub fn get_kill_on_drop(&self) -> bool {
         self.kill_on_drop
     }
 
-    /// Whether the status of the process is collected for the [`Child`], once it exits, when the
-    /// `Child` is dropped while the process runs, which it is by default.
+    /// Whether the status of the process is collected when its [`Child`] is dropped while the
+    /// process is still running.
     ///
-    /// [`reap_on_drop`](Command::reap_on_drop) sets it. It makes no difference on Windows, where a
-    /// process that exits leaves nothing to collect.
+    /// The default is `true`. [`reap_on_drop`](Command::reap_on_drop) sets it. It makes no
+    /// difference on Windows, where an exited process leaves nothing to collect.
     pub fn get_reap_on_drop(&self) -> bool {
         self.reap_on_drop
     }
 
-    /// The std command inside this one, for what it has getters for: the program, the arguments,
-    /// the environment and the working directory.
+    /// The std command inside this one, to read the program, the arguments, the environment and the
+    /// working directory.
     ///
-    /// Whether the process is killed or has its status collected when its [`Child`] is dropped is
-    /// not std's to tell, and is read through [`get_kill_on_drop`](Command::get_kill_on_drop) and
-    /// [`get_reap_on_drop`](Command::get_reap_on_drop) instead.
+    /// The std command knows nothing about what happens when the [`Child`] is dropped. Read that
+    /// with [`get_kill_on_drop`](Command::get_kill_on_drop) and
+    /// [`get_reap_on_drop`](Command::get_reap_on_drop).
     pub fn as_std(&self) -> &std::process::Command {
         &self.inner
     }
 
-    /// The std command inside this one, to configure with what only it has: the extension traits
-    /// of std for the platform, such as `uid`, `pre_exec` and `process_group` of unix, or
-    /// `creation_flags` of Windows.
+    /// The std command inside this one, to configure with what only it has.
     ///
-    /// The standard streams are not for this. A stream configured on the std command, not through
-    /// the builder this is a part of, is not known to it, and is overridden by the default that the
-    /// method that spawns it gives it. Configure them with [`stdin`](Command::stdin),
-    /// [`stdout`](Command::stdout) and [`stderr`](Command::stderr).
+    /// That is the std extension traits for the platform, such as `uid`, `pre_exec` and
+    /// `process_group` on unix, or `creation_flags` on Windows.
+    ///
+    /// Do not configure the standard streams through it. This builder does not know about a stream
+    /// set there, so the method that runs the command overrides it with its default. Use
+    /// [`stdin`](Command::stdin), [`stdout`](Command::stdout) and [`stderr`](Command::stderr)
+    /// instead.
     pub fn as_std_mut(&mut self) -> &mut std::process::Command {
         &mut self.inner
     }
 
-    /// Spawns the process on `runtime`, and hands back the [`Child`] that is its handle.
+    /// Spawns the process on `runtime` and returns its [`Child`].
     ///
-    /// The standard streams that the command was not told about are inherited from this process.
-    /// A stream that it was told to pipe is the pipe of that name in the child, ready to be
-    /// written to or read from, which is watched by `runtime` on unix and runs on a thread of the
-    /// pool of [`unblock()`](crate::unblock()) on Windows.
+    /// The process is running when this returns. A standard stream that the command was not told
+    /// about is inherited from this process. A stream set to `Stdio::piped()` is the matching pipe
+    /// field of the `Child`. On unix, `runtime` watches the pipes. On Windows, they run on a thread
+    /// of the pool of [`unblock()`](crate::unblock()).
     ///
-    /// The process is running by the time this returns. What can fail is the spawn, for the reasons
-    /// std's [`spawn`](std::process::Command::spawn) gives: a program that is not there, say, or
-    /// not allowed to run. It can fail too at setting up what `runtime` is to watch: the pipes,
-    /// and, where the runtime watches for the exit of the process, the descriptor that tells of
-    /// it. The system's poller may refuse to watch any of them, and on Apple's platforms and the
-    /// BSDs the system may refuse to make that descriptor, as it does for want of descriptors,
-    /// for there is no wait on a thread of the pool there to fall back on. A process that has
-    /// been spawned by then is killed, and its status collected, rather than left running with
-    /// nobody to hold it.
+    /// # Errors
+    ///
+    /// Fails if the process cannot be spawned, for the reasons given by std's
+    /// [`spawn`](std::process::Command::spawn), for example a program that does not exist or may
+    /// not run.
+    ///
+    /// Also fails if `runtime` cannot start watching the pipes, or the descriptor for the exit of
+    /// the process if the runtime watches for the exit. The poller of the system may refuse to
+    /// watch any of them. On Apple's platforms and the BSDs, the system may also refuse to create
+    /// that descriptor, for example if the process is out of descriptors, because there is no other
+    /// way to wait there. The process is then killed and its status is collected, so it is not left
+    /// running with nobody holding it.
     pub fn spawn<M>(&mut self, runtime: &Runtime<M>) -> io::Result<Child<M>>
     where
         M: Mode,
@@ -392,18 +408,23 @@ impl Command {
         self.start(runtime, Stdio::inherit, Stdio::inherit, Stdio::inherit)
     }
 
-    /// Spawns the process on `runtime`, waits for it to exit, and resolves to its exit status.
+    /// Spawns the process on `runtime`, waits for it to exit and resolves to its exit status.
     ///
-    /// The standard streams that the command was not told about are inherited from this process,
-    /// as for [`spawn`](Command::spawn). The pipe to the standard input of the process, if the
-    /// command asked for one, is closed before the wait, as [`Child::status`] closes it. A pipe
-    /// from the process that nothing reads from may fill, and stop the process from ever exiting:
-    /// [`output`](Command::output) is for a process whose output is wanted.
+    /// A standard stream that the command was not told about is inherited from this process, as for
+    /// [`spawn`](Command::spawn). The pipe to the standard input, if the command asked for one, is
+    /// closed before the wait, as [`Child::status`] does. A pipe from the process that nothing
+    /// reads may fill and keep the process from ever exiting. Use [`output`](Command::output) for
+    /// a process whose output you want.
     ///
     /// The process is spawned by this call, before the future is polled, and runs whether or not
-    /// the future is: a spawn that fails is the error the future resolves to. Dropping the future
-    /// gives up the wait, and drops the child, which leaves the process running unless the command
-    /// said [`kill_on_drop`](Command::kill_on_drop).
+    /// the future is polled. Dropping the future gives up the wait and drops the child. The process
+    /// keeps running unless the command set [`kill_on_drop`](Command::kill_on_drop).
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to the error if the spawn fails, for the reasons given for
+    /// [`spawn`](Command::spawn), or if the wait fails, for the reasons given for
+    /// [`Child::status`].
     pub fn status<M>(
         &mut self,
         runtime: &Runtime<M>,
@@ -420,19 +441,24 @@ impl Command {
         }
     }
 
-    /// Spawns the process on `runtime`, and resolves to what it wrote to its standard output and
-    /// its standard error, and to its exit status, once it has exited.
+    /// Spawns the process on `runtime` and resolves to its output and exit status once it exits.
     ///
-    /// The standard streams that the command was not told about are connected to nothing, for the
-    /// standard input, and to a pipe each for the standard output and error, which are read to
-    /// their ends. A stream the command was told about otherwise is as it was told, and what is not
+    /// The output holds what the process wrote to its standard output and its standard error. A
+    /// standard stream that the command was not told about is connected to nothing for the standard
+    /// input, and to a pipe for each of the standard output and error, which are read to their
+    /// ends. A stream that the command was told about is as it was told, and a stream that is not
     /// piped is not captured: the output holds nothing of it. See [`Child::output`] for how the
     /// pipes are read.
     ///
     /// The process is spawned by this call, before the future is polled, and runs whether or not
-    /// the future is: a spawn that fails is the error the future resolves to. Dropping the future
-    /// gives up the wait, and drops the child, which leaves the process running unless the command
-    /// said [`kill_on_drop`](Command::kill_on_drop).
+    /// the future is polled. Dropping the future gives up the wait and drops the child. The process
+    /// keeps running unless the command set [`kill_on_drop`](Command::kill_on_drop).
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to the error if the spawn fails, for the reasons given for
+    /// [`spawn`](Command::spawn), or if reading the pipes or the wait fails, for the reasons given
+    /// for [`Child::output`].
     pub fn output<M>(
         &mut self,
         runtime: &Runtime<M>,
@@ -475,9 +501,12 @@ impl Command {
     }
 }
 
-/// A command that wraps `command`, whose standard streams count as not configured, whatever
-/// `command` says of them. As for [`Command::new`], it does not kill the process when its
-/// [`Child`] is dropped, and does collect its status where the platform needs that.
+/// Wraps a std command.
+///
+/// The standard streams configured on `command` count as not configured, so the method that runs
+/// the command overrides them with its defaults. As with [`Command::new`], the process is not
+/// killed when its [`Child`] is dropped, and its status is collected where the platform needs
+/// that.
 impl From<std::process::Command> for Command {
     fn from(command: std::process::Command) -> Self {
         Self {
@@ -499,22 +528,21 @@ impl fmt::Debug for Command {
 
 /// A spawned child process, with the pipes to it that its command asked for.
 ///
-/// It is made by [`Command::spawn`], on a runtime that its type carries the flavour of: a
-/// `Child<Local>`, [`Local`] being the default, stays on the thread it was made on, and a
-/// `Child<Shared>` may be sent to, and used from, any thread. See the
-/// [module documentation](self) for what drives it.
+/// [`Command::spawn`] creates it on a runtime. A `Child<Local>` (`Local` is the default) stays on
+/// the thread that created it, and a `Child<Shared>` can be sent to and used from any thread. See
+/// the [module documentation](self) for what drives it.
 ///
-/// The pipes are fields, `Some` for each of the standard streams that its command asked to
-/// `Stdio::piped()` and `None` for each of the others, so a pipe can be taken out and moved
-/// elsewhere, as in `let Child { stdout, .. } = child;` or `child.stdout.take()`. A `Child` has no
-/// `Drop` of its own to stand in the way, so that works for every field.
+/// The pipes are public fields. Each is `Some` if the command asked for it with `Stdio::piped()`,
+/// and `None` otherwise. To move a pipe elsewhere, take it out, as in `child.stdout.take()` or
+/// `let Child { stdout, .. } = child;`. `Child` has no `Drop` implementation, so this works for
+/// every field.
 ///
-/// What dropping it does to the process, which is nothing unless the command said otherwise, is
-/// described in the [module documentation](self#dropping-a-child).
+/// Dropping a `Child` leaves the process running unless the command said otherwise: see the
+/// [module documentation](self#dropping-a-child).
 ///
 /// # Example
 ///
-/// The output of a child as it is written, then its exit status:
+/// Reads the output of a child as it is written, then waits for its exit status:
 ///
 /// ```
 /// # #[cfg(unix)]
@@ -552,8 +580,8 @@ where
 {
     /// The pipe to the standard input of the process, if its command asked for one.
     ///
-    /// Dropping it closes the pipe, and a child that reads its input to the end reads that end
-    /// then. [`status`](Child::status) and [`output`](Child::output) drop it themselves.
+    /// Dropping it closes the pipe, and a child that reads its input to the end sees the end then.
+    /// [`status`](Child::status) and [`output`](Child::output) drop it themselves.
     pub stdin: Option<ChildStdin<M>>,
     /// The pipe from the standard output of the process, if its command asked for one.
     pub stdout: Option<ChildStdout<M>>,
@@ -571,44 +599,60 @@ where
 {
     /// The process ID of the child.
     ///
-    /// The ID identifies the process until it has exited and its status has been collected, by
-    /// [`status`](Child::status) or [`try_status`](Child::try_status): the system may give it to
-    /// another process after that.
+    /// The ID refers to this process until it has exited and its status has been collected, by
+    /// [`status`](Child::status) or [`try_status`](Child::try_status). After that, the system may
+    /// give it to another process.
     pub fn id(&self) -> u32 {
         self.guard.get().id()
     }
 
-    /// Forces the process to exit, and returns without waiting for it to.
+    /// Forces the process to exit, without waiting for it to do so.
     ///
-    /// This is `SIGKILL` on unix and `TerminateProcess` on Windows, and what it takes to wait for
-    /// the process to be gone is [`status`](Child::status) after it. Killing a process whose status
-    /// has been collected already is no error, as it is not for std's
-    /// [`kill`](std::process::Child::kill).
+    /// This sends `SIGKILL` on unix and calls `TerminateProcess` on Windows. To wait until the
+    /// process is gone, call [`status`](Child::status) afterwards. As with std's
+    /// [`kill`](std::process::Child::kill), killing a process whose status has already been
+    /// collected is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the OS cannot kill the process.
     pub fn kill(&mut self) -> io::Result<()> {
         self.guard.get_mut().kill()
     }
 
-    /// The exit status of the process if it has exited, and `None` if it is still running.
+    /// Checks whether the process has exited, without waiting.
     ///
-    /// This never waits. Unlike [`status`](Child::status), it leaves the pipe to the standard input
-    /// of the process open. It collects the status of a process that has exited, and the status
-    /// is the same each time it is asked for after that.
+    /// Returns the exit status if it has, and `None` if it is still running. Unlike
+    /// [`status`](Child::status), this leaves the pipe to the standard input open. When the process
+    /// has exited, this collects its status, and every later call returns the same status.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the OS cannot report the status of the process.
     pub fn try_status(&mut self) -> io::Result<Option<ExitStatus>> {
         self.guard.get_mut().try_wait()
     }
 
-    /// Waits for the process to exit, and resolves to its exit status.
+    /// Waits for the process to exit and resolves to its exit status.
     ///
-    /// The pipe to the standard input of the process is dropped first, as std's `wait` drops it: a
-    /// process that reads its input to the end would otherwise wait for this pipe to be closed,
-    /// and this for the process to exit, for good. The pipes from the process are left as they
-    /// are, and a process that fills one that nothing reads from waits for that in turn, so read
-    /// them while waiting, or use [`output`](Child::output), which does.
+    /// The pipe to the standard input is dropped first, as std's `wait` does. Otherwise a process
+    /// that reads its input to the end would wait for the pipe to close, while this waits for the
+    /// process to exit. The pipes from the process stay open. A process that fills a pipe that
+    /// nothing reads blocks, so read them while waiting, or use [`output`](Child::output), which
+    /// does.
     ///
-    /// A process that has exited resolves at once, and so does a call after the status was
-    /// collected, to the same status again. The future may be dropped, which loses nothing: the
-    /// next call takes up the wait, and a process that exited meanwhile is found as it is. See the
-    /// [module documentation](self#waiting-for-a-child) for what the wait is made of.
+    /// If the process has already exited, or its status was collected earlier, this resolves at
+    /// once, with the same status each time. See the
+    /// [module documentation](self#waiting-for-a-child) for how the wait works.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the OS cannot report the status of the process, or the runtime cannot wait for it.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future loses nothing. The next call takes up the wait, and finds a process that
+    /// exited in the meantime as it is.
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
 
@@ -623,20 +667,29 @@ where
         }
     }
 
-    /// Collects what the process writes to its standard output and its standard error, and waits
-    /// for it to exit.
+    /// Reads everything the process writes to its standard output and error, then waits for it to
+    /// exit.
     ///
-    /// The pipe to the standard input of the process is dropped first, so that a process that
-    /// reads its input to the end is not left waiting for this to close it. Then the pipes from
-    /// the process, those it has, are read to their ends, both at the same time: a process that
-    /// fills one while this waits to read the other would otherwise never get to write the rest.
-    /// What is not piped is not captured, and the output holds nothing of it. Only then is the
-    /// process waited for, as [`status`](Child::status) waits.
+    /// The pipe to the standard input is dropped first, so that a process that reads its input to
+    /// the end does not wait for this to close it. Then the pipes from the process, those it has,
+    /// are read to their ends, both at the same time. Reading them one after the other could
+    /// deadlock: a process that fills one pipe while this reads the other would never write the
+    /// rest. A stream that is not piped is not captured, and the output holds nothing of it.
+    /// Finally this waits for the process, as [`status`](Child::status) does.
     ///
-    /// The pipes are those of the child: a command that is run for its output is better off with
+    /// Only the pipes of this child are read. To run a command for its output, use
     /// [`Command::output`], which pipes the right ones.
     ///
-    /// If reading a pipe fails, so does this, with the error, and the process is not waited for.
+    /// # Errors
+    ///
+    /// Fails if reading a pipe fails, or if waiting for the process fails. If reading fails, this
+    /// does not wait for the process, and the child is dropped.
+    ///
+    /// # Cancel safety
+    ///
+    /// Not cancel safe. This takes the child by value, so dropping the future drops the child and
+    /// discards what was read. See [Dropping a child](self#dropping-a-child) for what that does to
+    /// the process.
     pub async fn output(mut self) -> io::Result<Output> {
         drop(self.stdin.take());
 

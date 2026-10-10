@@ -29,38 +29,35 @@ use crate::{Local, Mode, Runtime};
 
 /// The pipe to a child's standard input, to write to.
 ///
-/// It is made for a child whose command asked for it with `Stdio::piped()`, and is found in the
-/// [`stdin`](super::Child::stdin) of the [`Child`](super::Child). It is the async counterpart of
-/// [`std::process::ChildStdin`]: a write that has to wait leaves the thread to the other tasks
-/// instead of blocking it. It implements the `AsyncWrite` trait of [`futures-io`], so the extension
-/// traits of [`futures`] write to it.
+/// [`Child::stdin`](super::Child::stdin) holds it if the command asked for `Stdio::piped()`. It is
+/// the async counterpart of [`std::process::ChildStdin`]: a write that has to wait lets other
+/// tasks run instead of blocking the thread. It implements the `AsyncWrite` trait of
+/// [`futures-io`], so the extension traits of [`futures`] work on it.
 ///
-/// Closing it, as the `close` of `AsyncWriteExt` does, flushes it and then closes the pipe, and so
-/// does dropping it, but for the flush: either way, the child reads the end of its input once it
-/// has read what was written. A child that reads its input to the end can only finish after that,
-/// which code that writes to any `AsyncWrite` and closes it once it is done sees to. A write after
-/// the close fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe), and a flush or a close after it
-/// has nothing left to do. [`Child::status`](super::Child::status) and
-/// [`Child::output`](super::Child::output) drop the pipe themselves before they wait.
+/// Closing the pipe, for example with `close` of `AsyncWriteExt`, flushes it and then closes it.
+/// Dropping the pipe also closes it, without a flush. Either way, the child sees the end of its
+/// input after it has read what was written. A child that reads its input to the end can only
+/// finish after that, so close the pipe when you are done writing. A write after the close fails
+/// with [`BrokenPipe`](io::ErrorKind::BrokenPipe). A later flush or close does nothing.
+/// [`Child::status`](super::Child::status) and [`Child::output`](super::Child::output) drop the
+/// pipe before they wait.
 ///
-/// On unix the pipe is in non-blocking mode, and a write that finds it full waits for the runtime
-/// to report room in it. A write goes to the pipe as it is made, so flushing has nothing to do. On
-/// Windows, where the runtime cannot watch a pipe, a write hands its bytes over to blocking work on
-/// a thread of the pool of [`unblock()`](crate::unblock()), and a flush waits for the bytes handed
-/// over so far to be written. Close or flush before dropping the pipe to learn of an error in
-/// those writes: bytes the pipe is dropped with are written all the same, but an error they run
-/// into goes unreported.
+/// On unix, the pipe is non-blocking. A write that finds it full waits until the runtime reports
+/// room in it. Writes go straight to the pipe, so a flush has nothing to do. On Windows, the
+/// runtime cannot watch a pipe: a write hands its bytes to blocking work on a thread of the pool
+/// of [`unblock()`](crate::unblock()), and a flush waits until the bytes handed over so far are
+/// written. To learn of an error in those writes, flush or close the pipe before dropping it.
+/// Bytes still pending when the pipe is dropped are written anyway, but an error they run into
+/// is not reported.
 ///
-/// The pipe belongs to the runtime the child was spawned on, and its type carries that runtime's
-/// flavour: one of a child spawned on a [`LocalRuntime`](crate::LocalRuntime) is a
-/// `ChildStdin<Local>`, [`Local`] being the default, and stays on the thread it was made on; one of
-/// a child spawned on a [`SharedRuntime`](crate::SharedRuntime) is a `ChildStdin<Shared>`, which
-/// may be sent to, and used from, any thread. See the [module documentation](super) for what
-/// drives it.
+/// The pipe belongs to the runtime the child was spawned on. Its type parameter is the flavour of
+/// that runtime, `Local` by default, as for [`Child`](super::Child): see the
+/// [module documentation](super).
 ///
 /// # Example
 ///
-/// A child that sorts the lines it reads, given its input and then the end of it:
+/// Writes to a child that sorts the lines it reads, then closes the pipe to give it the end of its
+/// input:
 ///
 /// ```
 /// # #[cfg(unix)]
@@ -81,7 +78,7 @@ use crate::{Local, Mode, Runtime};
 ///
 ///     let mut stdin = child.stdin.take().expect("stdin is piped");
 ///     stdin.write_all(b"pear\napple\n").await?;
-///     // The child reads the end of its input once the pipe is closed, which dropping it does.
+///     // Dropping the pipe closes it, so the child reads the end of its input.
 ///     drop(stdin);
 ///
 ///     let mut sorted = String::new();
@@ -118,20 +115,23 @@ where
         })
     }
 
-    /// Hands the pipe over to be the standard output or error of another child.
+    /// Converts the pipe into a [`Stdio`] for the standard output or error of another child.
     ///
-    /// This is how the processes of a pipeline are connected: the child that is given the pipe
-    /// writes into the input of the child the pipe was made for, with no byte passing through the
-    /// code that holds it. The pipe is written to no more once it is handed over. It is flushed
-    /// first: on Windows, the bytes written to it may not have reached the pipe yet, and an error
-    /// in writing them is reported here rather than lost.
+    /// This connects the processes of a pipeline: the child that gets the pipe writes straight into
+    /// the input of the child this pipe was made for, with no byte passing through your code. You
+    /// cannot write to the pipe after this.
     ///
-    /// The pipe is made blocking again, as a program that is handed one expects it to be: unix has
-    /// the mode as a property of the open pipe, which the other child shares, not of the handle.
+    /// The pipe is flushed first. On Windows, the bytes written to it may not have reached the pipe
+    /// yet, and an error in writing them is reported here instead of being lost.
     ///
-    /// What can fail is the flush, the switch back to blocking mode, on unix, and a pipe that has
-    /// been closed already, with [`BrokenPipe`](io::ErrorKind::BrokenPipe): there is no pipe left
-    /// to hand over.
+    /// The pipe is switched back to blocking mode, as a program that is given one expects. On unix,
+    /// the mode belongs to the open pipe, which the other child shares, not to the handle.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the flush fails, and, on unix, if the pipe cannot be switched back to blocking
+    /// mode. Fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) if the pipe has been closed
+    /// already, as there is no pipe left to hand over.
     pub async fn into_stdio(self) -> io::Result<Stdio> {
         let Some(mut pipe) = self.pipe else {
             return Err(closed());
@@ -177,7 +177,7 @@ where
         Pin::new(pipe).poll_write_vectored(cx, bufs)
     }
 
-    /// A pipe that has been closed has nothing left to flush.
+    /// Flushes the pipe. Does nothing if the pipe has been closed.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let Some(pipe) = &mut self.get_mut().pipe else {
             return Poll::Ready(Ok(()));
@@ -186,11 +186,11 @@ where
         Pin::new(pipe).poll_flush(cx)
     }
 
-    /// Flushes the pipe and then closes it, which the child reads the end of its input at.
+    /// Flushes the pipe and then closes it, so the child reads the end of its input.
     ///
-    /// The pipe is closed once the flush is over, whether or not it succeeded, and the flush's
-    /// outcome is what this returns: a close that fails has closed the pipe all the same. A pipe
-    /// that has been closed already has nothing left to do.
+    /// The pipe is closed once the flush is over, whether or not it succeeded, and this returns the
+    /// result of the flush. A close that fails has closed the pipe all the same. Does nothing if
+    /// the pipe has been closed already.
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let Some(pipe) = &mut this.pipe else {
@@ -215,36 +215,33 @@ where
 
 /// The pipe from a child's standard output, to read from.
 ///
-/// It is made for a child whose command asked for it with `Stdio::piped()`, and is found in the
-/// [`stdout`](super::Child::stdout) of the [`Child`](super::Child). It is the async counterpart of
-/// [`std::process::ChildStdout`]: a read that has to wait leaves the thread to the other tasks
-/// instead of blocking it. It implements the `AsyncRead` trait of [`futures-io`], so the extension
-/// traits of [`futures`] read from it. A read finds the end of the pipe, and returns zero bytes,
-/// once every byte the child wrote has been read and no process holds the other end of the pipe
-/// open any more: the child exits or closes its standard output, whichever comes first, and any
-/// process it started that inherited the pipe does the same.
+/// [`Child::stdout`](super::Child::stdout) holds it if the command asked for `Stdio::piped()`. It
+/// is the async counterpart of [`std::process::ChildStdout`]: a read that has to wait lets other
+/// tasks run instead of blocking the thread. It implements the `AsyncRead` trait of
+/// [`futures-io`], so the extension traits of [`futures`] work on it.
 ///
-/// Dropping it closes the pipe, and a child that writes to it after that fails to, or is
-/// terminated by the signal that says so.
+/// A read returns zero bytes at the end of the pipe. The end comes once every byte the child wrote
+/// has been read and every process that holds the write end has closed it. The child closes it
+/// when it exits or closes its standard output. So must any process the child started that
+/// inherited the pipe.
 ///
-/// On unix the pipe is in non-blocking mode, and a read that finds it empty waits for the runtime
-/// to report bytes in it. On Windows, where the runtime cannot watch a pipe, a read is blocking
-/// work on a thread of the pool of [`unblock()`](crate::unblock()), which reads ahead of what the
-/// reader asked for, up to 8 KiB. Such a read runs to its end once it has started, whether or not
-/// its future is dropped: a pipe dropped while one is under way stays open, and the thread
-/// held, until the read returns, with the next bytes the child writes, which are lost, or with the
-/// end of the pipe.
+/// Dropping the pipe closes it. A child that then writes to its standard output gets a broken-pipe
+/// error or, on unix, is killed by `SIGPIPE` unless it ignores that signal.
 ///
-/// The pipe belongs to the runtime the child was spawned on, and its type carries that runtime's
-/// flavour: one of a child spawned on a [`LocalRuntime`](crate::LocalRuntime) is a
-/// `ChildStdout<Local>`, [`Local`] being the default, and stays on the thread it was made on; one
-/// of a child spawned on a [`SharedRuntime`](crate::SharedRuntime) is a `ChildStdout<Shared>`,
-/// which may be sent to, and used from, any thread. See the [module documentation](super) for what
-/// drives it.
+/// On unix, the pipe is non-blocking. A read that finds it empty waits until the runtime reports
+/// data in it. On Windows, the runtime cannot watch a pipe, so each read is blocking work on a
+/// thread of the pool of [`unblock()`](crate::unblock()). It reads ahead of what the caller asked
+/// for, up to 8 KiB. A read that has started runs to its end, even if its future is dropped. A
+/// pipe dropped during such a read stays open, and the thread stays held, until the read returns.
+/// That happens when the child next writes, and those bytes are lost, or when the pipe ends.
+///
+/// The pipe belongs to the runtime the child was spawned on. Its type parameter is the flavour of
+/// that runtime, `Local` by default, as for [`Child`](super::Child): see the
+/// [module documentation](super).
 ///
 /// # Example
 ///
-/// The lines a child prints, read one at a time as it prints them:
+/// Reads the lines a child prints, one at a time as it prints them:
 ///
 /// ```
 /// # #[cfg(unix)]
@@ -298,24 +295,27 @@ where
         })
     }
 
-    /// Hands the pipe over to be the standard input of another child.
+    /// Converts the pipe into a [`Stdio`] for the standard input of another child.
     ///
-    /// This is how the processes of a pipeline are connected: the child that the pipe was made for
-    /// writes into it, and the child that is given it reads what that one wrote, with no byte
-    /// passing through the code that holds it. The pipe is read from no more once it is handed
-    /// over, and what was read from it before is gone from it: on Windows, that includes the bytes
-    /// the handle read ahead of what was asked for, which are dropped. A read under way there, one
-    /// that was given up on included, is waited for first, which takes until the child writes
-    /// again, or the pipe ends, and what it reads is dropped as well.
+    /// This connects the processes of a pipeline: the child that this pipe was made for writes into
+    /// it, and the child that gets the [`Stdio`] reads what the first one wrote, with no byte
+    /// passing through your code. You cannot read from the pipe after this, and the bytes already
+    /// read from it are gone.
     ///
-    /// The pipe is made blocking again, as a program that is handed one expects it to be: unix has
-    /// the mode as a property of the open pipe, which the other child shares, not of the handle.
+    /// On Windows, the bytes that the pipe read ahead of what was asked for are dropped. A read in
+    /// progress there, even one whose future was dropped, is waited for first. That takes until the
+    /// child writes again or the pipe ends, and the bytes it reads are dropped too.
     ///
-    /// What can fail is the switch back to blocking mode, on unix.
+    /// The pipe is switched back to blocking mode, as a program that is given one expects. On unix,
+    /// the mode belongs to the open pipe, which the other child shares, not to the handle.
+    ///
+    /// # Errors
+    ///
+    /// On unix, fails if the pipe cannot be switched back to blocking mode.
     ///
     /// # Example
     ///
-    /// `echo hello | cat`, with the output of the second child read back:
+    /// Runs `echo hello | cat` and reads the output of the second child:
     ///
     /// ```
     /// # #[cfg(unix)]
@@ -391,16 +391,15 @@ where
 
 /// The pipe from a child's standard error, to read from.
 ///
-/// It is made for a child whose command asked for it with `Stdio::piped()`, and is found in the
-/// [`stderr`](super::Child::stderr) of the [`Child`](super::Child). It is the async counterpart of
-/// [`std::process::ChildStderr`], and is read from exactly as the pipe of the standard output,
-/// [`ChildStdout`], is: see there for how reads wait, what the end of the pipe is, and what the
-/// type's flavour means.
+/// [`Child::stderr`](super::Child::stderr) holds it if the command asked for `Stdio::piped()`. It
+/// is the async counterpart of [`std::process::ChildStderr`], and is read exactly like the pipe of
+/// the standard output, [`ChildStdout`]: see there for how reads wait, where the pipe ends, and
+/// what the type parameter means.
 ///
-/// A child that writes a lot to both its output and its error blocks, once the pipe of one of
-/// them is full, until that pipe is read. A task that reads one of the pipes to its end before it
-/// reads the other waits for good where the child is stuck that way, so the two are read at the
-/// same time, as [`Child::output`](super::Child::output) reads them.
+/// A child that writes a lot to both its output and its error blocks once one of the pipes is
+/// full, until that pipe is read. A task that reads one pipe to its end before the other waits
+/// forever if the child is stuck on the other pipe. Read both pipes at the same time, as
+/// [`Child::output`](super::Child::output) does.
 pub struct ChildStderr<M = Local>
 where
     M: Mode,
@@ -419,9 +418,9 @@ where
         })
     }
 
-    /// Hands the pipe over to be the standard input of another child.
+    /// Converts the pipe into a [`Stdio`] for the standard input of another child.
     ///
-    /// It is as [`ChildStdout::into_stdio`] is, for the pipe of the standard error.
+    /// It works as [`ChildStdout::into_stdio`] does, for the pipe of the standard error.
     pub async fn into_stdio(self) -> io::Result<Stdio> {
         self.pipe.into_stdio().await
     }
