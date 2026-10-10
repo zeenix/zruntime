@@ -124,53 +124,57 @@ use std::{
 
 /// A notification that tasks can wait for.
 ///
-/// An event is where a task waits for a condition to change — a lock to be released, a queue to
-/// have room, a connection to close. The task takes a listener with [`Event::listen`] and awaits
-/// it, and whoever changes the condition notifies the event, which wakes the tasks listening. The
-/// event carries no value and knows nothing of the condition: it only brings the news that
-/// something changed, to the listeners there to hear it.
+/// A task that waits for a condition to change, such as a lock being released or a queue getting
+/// room, calls [`Event::listen`] and awaits the [`EventListener`] it gets. Whoever changes the
+/// condition notifies the event, which wakes the tasks that are listening.
 ///
-/// An event needs no runtime. A listener is a plain [`Future`], woken through the waker of
-/// whatever polled it last, so it works under any executor, and an event may be notified from any
-/// thread, from inside a task or from outside of one.
+/// An event carries no value and knows nothing about the condition. It only reports that something
+/// changed.
+///
+/// An event needs no runtime and works under any executor. It can be notified from any thread, from
+/// inside a task or from outside one. An [`EventListener`] is a plain [`Future`]. A notification
+/// wakes the task that polled it last.
 ///
 /// # Listen, then check
 ///
-/// A notification reaches only the listeners there when it is sent: one sent before a listener
-/// was taken is not kept for it. So a task takes its listener before its last check of the
-/// condition, and awaits the listener only where that check fails. A change made before the
-/// check is then one the check sees, and a change made after it is one the listener hears of.
-/// Checking first and listening after leaves a gap between the two, in which a notification can
-/// come and go unheard while the task goes on to wait for good.
+/// A notification reaches only the listeners that exist when it is sent. It is not kept for
+/// listeners created later. So a task creates its listener first, then checks the condition, and
+/// awaits the listener only if the check fails:
 ///
-/// # How many listeners a notification reaches
+/// * A change made before the check is seen by the check.
+/// * A change made after the check is heard by the listener.
+///
+/// If the task checks first and listens afterwards, a notification can arrive between the two and
+/// go unheard, and the task waits forever.
+///
+/// # Which listeners are notified
 ///
 /// Listeners are notified oldest first. A listener counts as notified from the moment a
-/// notification reaches it until it completes or is dropped. [`Event::notify`] counts those:
-/// `notify(n)` notifies listeners until at least `n` are notified, so calling `notify(1)` twice in
-/// a row notifies one listener, not two. That suits a condition that only one waiter can act on,
-/// such as a lock that only one of them can take. [`Event::notify_additional`] notifies `n` more
-/// listeners, regardless of how many are notified already, which suits a condition that `n` more
-/// waiters can act on, such as a queue with `n` more items in it. `notify(usize::MAX)` notifies
-/// every listener there is.
+/// notification reaches it until it completes or is dropped.
 ///
-/// A listener dropped while notified, before it completed, passes its notification on, so that a
-/// task giving up its wait does not take the news with it. If `notify` sent the notification, the
-/// next listener gets it only if no other listener is notified at that point, as a `notify(1)`
-/// would do. If `notify_additional` sent it, the next listener gets it regardless.
+/// * [`Event::notify`] counts the listeners that are already notified. `notify(n)` notifies
+///   listeners until at least `n` are notified, so calling `notify(1)` twice in a row notifies one
+///   listener, not two. Use it when only one waiter can act on the change, such as a lock that only
+///   one task can take.
+/// * [`Event::notify_additional`] ignores that count. `notify_additional(n)` notifies `n` more
+///   listeners. Use it when `n` more waiters can act on the change, such as a queue that gained `n`
+///   items.
 ///
-/// The tasks a notification wakes are woken after the event has taken note of it, so that a waker
-/// is free to come back into the same event from its `wake`: to notify it, listen to it or drop
-/// one of its listeners. A listener polled on another thread in the meantime sees its
-/// notification and completes, so a task can be done with its listener while the thread that
-/// notified it still holds the waker it is waking. A waker that panics does not keep the others
-/// from being woken: every task a notification reached is woken, and the first panic reaches the
-/// caller once they all are.
+/// `notify(usize::MAX)` notifies every listener.
+///
+/// A listener that is dropped after it was notified passes its notification on. See
+/// [`EventListener`].
+///
+/// # Wakers
+///
+/// The event records a notification before it wakes any task. So a waker can call back into the
+/// same event from `wake`: it can notify the event, listen to it or drop one of its listeners. A
+/// listener that another thread polls in the meantime already sees its notification and completes.
 ///
 /// # Example
 ///
-/// A flag that one thread raises and a task waits for. The task is driven by `block_on` from the
-/// `futures` crate, but the `block_on` of any executor would do, as an event needs no runtime:
+/// One thread raises a flag and a task waits for it. The example runs the task with `block_on`
+/// from the `futures` crate, but any executor works:
 ///
 /// ```
 /// use std::{
@@ -184,7 +188,7 @@ use std::{
 /// use futures::executor::block_on;
 /// use zruntime::Event;
 ///
-/// /// A flag, raised once, and the event its raising is announced through.
+/// /// A flag that is raised once, and the event that announces it.
 /// struct Flag {
 ///     raised: AtomicBool,
 ///     event: Event,
@@ -203,7 +207,7 @@ use std::{
 /// });
 ///
 /// block_on(async {
-///     // Taken before the check, so that a raising the check misses is one it hears of.
+///     // Listen before the check, so a change that the check misses is heard by the listener.
 ///     let listener = flag.event.listen();
 ///     if !flag.raised.load(Ordering::Acquire) {
 ///         listener.await;
@@ -220,33 +224,40 @@ pub struct Event {
 }
 
 impl Event {
-    /// An event with nobody listening to it.
+    /// Creates an event with no listeners.
     ///
-    /// Making one allocates nothing, so an event can sit in a `static` or in a value made by a
-    /// `const fn` of its own.
+    /// This is a `const fn` and does not allocate, so an event can live in a `static`.
     pub const fn new() -> Self {
         Self {
             shared: OnceLock::new(),
         }
     }
 
-    /// A listener to this event, which completes once a notification reaches it.
+    /// Creates a listener that completes when a notification reaches it.
     ///
-    /// The listener is in the event's queue by the time this returns: every notification sent
-    /// from then on can reach it, whether it has been polled yet or not. Take it before the last
-    /// check of the condition it is for, as [listen, then check](Event#listen-then-check) says.
+    /// The listener is in the event's queue when this returns. Every notification sent from then on
+    /// can reach it, even if it has not been polled yet.
+    ///
+    /// See [listen, then check](Event#listen-then-check) for why to create the listener before the
+    /// last check of the condition it is for.
     pub fn listen(&self) -> EventListener {
         self.add_listener(Order::Fence)
     }
 
-    /// Notifies the oldest listeners not notified yet, until at least `n` listeners are notified
-    /// or none is left to notify.
+    /// Notifies the oldest listeners that are not notified yet, until at least `n` are notified.
     ///
-    /// Listeners notified earlier count towards `n` until they complete or are dropped, so this
-    /// notifies no listener if `n` are notified already, and `notify(usize::MAX)` notifies every
-    /// listener there is. The task that last polled each listener this notifies is woken.
+    /// Listeners that were notified earlier count towards `n` until they complete or are dropped.
+    /// So this notifies nobody if `n` listeners are notified already, and `notify(usize::MAX)`
+    /// notifies every listener. It stops early if there are no more listeners to notify.
     ///
-    /// Returns how many listeners this call notified.
+    /// Wakes the task that last polled each listener it notifies.
+    ///
+    /// Returns the number of listeners this call notified.
+    ///
+    /// # Panics
+    ///
+    /// If a waker panics, the tasks of the other notified listeners are still woken. The first
+    /// panic is then raised from this call.
     ///
     /// # Example
     ///
@@ -262,11 +273,11 @@ impl Event {
     /// let event = Event::new();
     /// let mut first = event.listen();
     /// let mut second = event.listen();
-    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// // Poll the listeners by hand, with a waker that does nothing.
     /// let mut cx = Context::from_waker(Waker::noop());
     ///
     /// assert_eq!(event.notify(1), 1);
-    /// // The first listener is still notified, so one listener is notified already.
+    /// // The first listener is still notified, so `notify(1)` notifies nobody.
     /// assert_eq!(event.notify(1), 0);
     ///
     /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
@@ -279,12 +290,17 @@ impl Event {
         self.send(n, Notification::Counting, Order::Fence)
     }
 
-    /// Notifies up to `n` more listeners, regardless of how many are notified already.
+    /// Notifies up to `n` more listeners, whether or not other listeners are notified already.
     ///
-    /// These are the `n` oldest listeners not notified yet, or all of them if there are fewer. The
-    /// task that last polled each listener this notifies is woken.
+    /// These are the `n` oldest listeners that are not notified yet, or all of them if there are
+    /// fewer. Wakes the task that last polled each listener it notifies.
     ///
-    /// Returns how many listeners this call notified.
+    /// Returns the number of listeners this call notified.
+    ///
+    /// # Panics
+    ///
+    /// If a waker panics, the tasks of the other notified listeners are still woken. The first
+    /// panic is then raised from this call.
     ///
     /// # Example
     ///
@@ -300,11 +316,11 @@ impl Event {
     /// let event = Event::new();
     /// let mut first = event.listen();
     /// let mut second = event.listen();
-    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// // Poll the listeners by hand, with a waker that does nothing.
     /// let mut cx = Context::from_waker(Waker::noop());
     ///
     /// assert_eq!(event.notify(1), 1);
-    /// // One more of whatever the first listener waits for, for the second one.
+    /// // There is one more thing to act on, so notify one more listener.
     /// assert_eq!(event.notify_additional(1), 1);
     ///
     /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
@@ -444,21 +460,31 @@ impl fmt::Debug for Event {
     }
 }
 
-/// A listener to an [`Event`], which completes once a notification reaches it.
+/// A listener to an [`Event`]. It completes when a notification reaches it.
 ///
-/// Made by [`Event::listen`], which puts it at the back of the event's queue: it can be reached
-/// by every notification sent from then on, whether it has been polled yet or not. A notification
-/// that reaches it wakes the task that polled it last, and it completes on its next poll. Polled
-/// again after it completed, it completes again at once.
+/// [`Event::listen`] creates one and puts it at the back of the event's queue. Every notification
+/// sent from then on can reach it, even if it has not been polled yet.
 ///
-/// Dropping a listener takes it out of the queue. If it was notified and had not completed yet, it
-/// passes its notification on to the next listener: if [`Event::notify`] sent the notification,
-/// only if no other listener is notified at that point, and if [`Event::notify_additional`] sent
-/// it, regardless.
+/// A notification that reaches the listener wakes the task that polled it last, and the listener
+/// completes on its next poll. Polling it again after it completed returns `Ready` at once.
 ///
-/// A listener may outlive its event. Dropping the event notifies nobody: a listener notified by
-/// then still completes, and one that was not can then be reached by nothing but a notification
-/// passed on to it by a notified listener dropped after the event.
+/// # Dropping a listener
+///
+/// Dropping a listener removes it from the queue. If the listener was notified but had not
+/// completed, it passes its notification on to the next listener:
+///
+/// * If [`Event::notify`] sent the notification, the next listener gets it only if no other
+///   listener is notified at that point.
+/// * If [`Event::notify_additional`] sent it, the next listener always gets it.
+///
+/// Passing a notification on wakes the next listener's task, so a waker that panics can make the
+/// drop panic.
+///
+/// # Outliving the event
+///
+/// A listener can outlive its [`Event`]. Dropping the event notifies nobody. A listener that was
+/// notified before that still completes. One that was not stays pending, unless a notified listener
+/// passes its notification on to it when dropped.
 pub struct EventListener {
     /// What the listener shares with its event, kept alive by the listener as much as by the
     /// event.

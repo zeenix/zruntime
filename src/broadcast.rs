@@ -2,16 +2,22 @@
 
 //! An async multi-producer multi-consumer broadcast channel.
 //!
-//! Each consumer gets a clone of every message sent on the channel. For obvious reasons, the
-//! channel can only be used to broadcast types that implement [`Clone`].
+//! Every receiver gets a clone of every message sent on the channel, so the message type must
+//! implement [`Clone`].
 //!
-//! A channel has the [`Sender`] and [`Receiver`] side. Both sides are cloneable and can be shared
-//! among multiple threads.
+//! A channel has a [`Sender`] side and a [`Receiver`] side. Both can be cloned and shared among
+//! threads.
 //!
-//! When all `Sender`s or all `Receiver`s are dropped, the channel becomes closed. When a channel is
-//! closed, no more messages can be sent, but remaining messages can still be received.
+//! The channel holds at most a fixed number of messages, its capacity. A message stays in the
+//! channel until each receiver it was sent to has received it or been dropped. When the channel is
+//! full, [`Sender::broadcast`] waits for room. In overflow mode ([`Sender::set_overflow`]), it
+//! removes the oldest message instead. A receiver that had not received that message then gets an
+//! `Overflowed` error.
 //!
-//! The channel can also be closed manually by calling [`Sender::close()`] or [`Receiver::close()`].
+//! The channel closes when all its senders are dropped, or when all its receivers are dropped. An
+//! [`InactiveReceiver`] counts as a receiver here: it keeps the channel open. [`Sender::close`] and
+//! [`Receiver::close`] also close the channel. A closed channel accepts no new messages, but
+//! receivers can still receive the messages that are left.
 //!
 //! # Examples
 //!
@@ -30,17 +36,17 @@
 //!     s1.broadcast(7).await.unwrap();
 //!     s2.broadcast(8).await.unwrap();
 //!
-//!     // Channel is now at capacity so sending more messages will result in an error.
+//!     // The channel is at capacity now, so sending more messages fails.
 //!     assert!(s2.try_broadcast(9).unwrap_err().is_full());
 //!     assert!(s1.try_broadcast(10).unwrap_err().is_full());
 //!
-//!     // We can use the `next` method of the `Stream` implementation to receive messages.
+//!     // Receive messages with `next` from the `Stream` impl, or with `recv`.
 //!     assert_eq!(r1.next().await.unwrap(), 7);
 //!     assert_eq!(r1.recv().await.unwrap(), 8);
 //!     assert_eq!(r2.next().await.unwrap(), 7);
 //!     assert_eq!(r2.recv().await.unwrap(), 8);
 //!
-//!     // All receivers got all messages so channel is now empty.
+//!     // Both receivers got both messages, so the channel is empty.
 //!     assert_eq!(r1.try_recv(), Err(TryRecvError::Empty));
 //!     assert_eq!(r2.try_recv(), Err(TryRecvError::Empty));
 //!
@@ -53,37 +59,23 @@
 //! })
 //! ```
 //!
-//! # Difference with `async-channel`
+//! # Comparison with other crates
 //!
-//! This channel is similar to [`async-channel`] in that both provide an MPMC channel. The main
-//! difference is that in `async-channel`, each message sent on the channel is only received by one
-//! of the receivers, while this channel delivers each message to every receiver (in other words,
-//! it broadcasts) by cloning it for each receiver.
-//!
-//! A channel of that kind, built on [`Event`] like this one, is this crate's `mpmc` module,
-//! behind the `mpmc` feature.
-//!
-//! # Difference with other broadcast channels
-//!
-//! * [`broadcaster`]: It has no sender and receiver split: both sides use clones of the same
-//!   `BroadcastChannel` instance, and a message sent on one is sent to all of the clones. While
-//!   this can work for many cases, without the split you will often find yourself having to drain
-//!   the channel on the sending side yourself.
-//!
-//! * [`postage`]: It provides a [broadcast API][pba] similar to this one. However, it:
-//!   - Does not support overflow mode, nor has the concept of inactive receivers, so a slow or
-//!     inactive receiver blocking the whole channel is not a solvable problem.
-//!   - Provides all kinds of channels, which is generally good but if you just need a broadcast
-//!     channel, this module is probably a better choice.
-//!
-//! * [`tokio::sync`]: Tokio's `sync` module provides a [broadcast channel][tbc] API. The
-//!   differences here are:
-//!   - Tokio's channel has [overflow mode][tom] as its only behavior: a sender never waits for
-//!     room. In this channel it is opt-in, through [`Sender::set_overflow`], and by default a
-//!     sender waits until there is room.
-//!   - There is no equivalent of inactive receivers.
-//!   - The channel is part of a much larger crate, which you may not otherwise need, while this
-//!     module needs nothing but [`Event`] and the standard library, and no runtime.
+//! * [`async-channel`] delivers each message to one receiver. This channel delivers each message to
+//!   every receiver, by cloning it. The `mpmc` module of this crate, built on [`Event`] like this
+//!   one, is a channel of the first kind (it requires the `mpmc` feature).
+//! * [`broadcaster`] has no sender and receiver split. Both sides use clones of one
+//!   `BroadcastChannel`, and a message sent on one clone goes to all clones, including the sending
+//!   one. Without the split, you often have to drain the channel on the sending side yourself.
+//! * [`postage`] has a similar [broadcast API][pba]. It has no overflow mode and no inactive
+//!   receivers, so a slow or inactive receiver can block the whole channel, and nothing can be done
+//!   about that. It also offers many other kinds of channel. If you only need a broadcast channel,
+//!   this module is probably the better choice.
+//! * [`tokio::sync`] has a [broadcast channel][tbc] whose only behaviour is [overflow mode][tom]: a
+//!   sender never waits for room. Here overflow mode is opt-in through [`Sender::set_overflow`],
+//!   and by default a sender waits for room. Tokio has no equivalent of inactive receivers. Tokio's
+//!   channel is part of a much larger crate, while this module needs only [`Event`] and the
+//!   standard library, and no runtime.
 //!
 //! [`async-channel`]: https://crates.io/crates/async-channel
 //! [`broadcaster`]: https://crates.io/crates/broadcaster
@@ -108,9 +100,9 @@ use futures_core::{ready, stream::Stream};
 
 use crate::{Event, EventListener};
 
-/// Creates a new broadcast channel.
+/// Creates a broadcast channel that holds at most `cap` messages.
 ///
-/// The created channel has space to hold at most `cap` messages at a time.
+/// Returns the first [`Sender`] and [`Receiver`]. Clone them to get more.
 ///
 /// # Examples
 ///
@@ -160,12 +152,10 @@ pub fn channel<T>(cap: NonZeroUsize) -> (Sender<T>, Receiver<T>) {
     (s, r)
 }
 
-/// The sending side of the broadcast channel.
+/// The sending side of a broadcast channel.
 ///
-/// Senders can be cloned and shared among threads. When all senders associated with a channel are
-/// dropped, the channel becomes closed.
-///
-/// The channel can also be closed manually by calling [`Sender::close()`].
+/// Senders can be cloned and shared among threads. The channel closes when all its senders are
+/// dropped, or when [`Sender::close`] is called.
 #[derive(Debug)]
 pub struct Sender<T> {
     channel: Arc<Channel<T>>,
@@ -187,11 +177,11 @@ impl<T> Sender<T> {
         lock(&self.channel.inner).capacity
     }
 
-    /// Sets the channel capacity.
+    /// Sets the capacity of the channel.
     ///
-    /// There are times when you need to change the channel's capacity after creating it. If the
-    /// `new_cap` is less than the number of messages in the channel, the oldest messages will be
-    /// dropped to shrink the channel.
+    /// If `new_cap` is less than the number of messages in the channel, the oldest messages are
+    /// dropped to fit. A receiver that had not received them gets [`RecvError::Overflowed`] or
+    /// [`TryRecvError::Overflowed`].
     ///
     /// # Examples
     ///
@@ -237,10 +227,12 @@ impl<T> Sender<T> {
         lock(&self.channel.inner).overflow
     }
 
-    /// Sets overflow mode on the channel.
+    /// Turns overflow mode on or off. It is off by default.
     ///
-    /// When overflow mode is set, broadcasting to the channel will succeed even if the channel is
-    /// full. It achieves that by removing the oldest message from the channel.
+    /// In overflow mode, broadcasting to a full channel succeeds. The oldest message is removed to
+    /// make room and returned to the caller. A receiver that had not received the removed message
+    /// gets [`RecvError::Overflowed`] or [`TryRecvError::Overflowed`]. Turning overflow mode on
+    /// also releases senders that are waiting for room: they send their message.
     ///
     /// # Examples
     ///
@@ -265,10 +257,10 @@ impl<T> Sender<T> {
         self.channel.set_overflow(overflow);
     }
 
-    /// Whether senders wait for active receivers.
+    /// Whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If `false`, [`Sender::broadcast`] fails with a [`SendError`] instead.
     ///
     /// # Examples
     ///
@@ -283,10 +275,11 @@ impl<T> Sender<T> {
         lock(&self.channel.inner).await_active
     }
 
-    /// Sets whether senders wait for active receivers.
+    /// Sets whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If set to `false`, [`Sender::broadcast`] fails with a [`SendError`] as soon as there is no
+    /// active receiver. This includes senders that are already waiting for one.
     ///
     /// # Examples
     ///
@@ -311,9 +304,9 @@ impl<T> Sender<T> {
 
     /// Closes the channel.
     ///
-    /// Returns `true` if this call has closed the channel and it was not closed already.
+    /// Returns `true` if this call closed the channel, and `false` if it was already closed.
     ///
-    /// The remaining messages can still be received.
+    /// Receivers can still receive the messages that are left.
     ///
     /// # Examples
     ///
@@ -417,10 +410,9 @@ impl<T> Sender<T> {
         lock(&self.channel.inner).queue.len()
     }
 
-    /// The number of receivers for the channel.
+    /// The number of active receivers.
     ///
-    /// This does not include inactive receivers. Use [`Sender::inactive_receiver_count`] if you
-    /// are interested in that.
+    /// Inactive receivers are not counted. Use [`Sender::inactive_receiver_count`] for those.
     ///
     /// # Examples
     ///
@@ -484,8 +476,8 @@ impl<T> Sender<T> {
 
     /// Creates a new [`Receiver`] for this channel.
     ///
-    /// The new receiver starts with zero messages available. This will not re-open the channel if
-    /// it was closed due to all receivers being dropped.
+    /// The new receiver starts with no messages available. This does not reopen a channel that
+    /// closed because all its receivers were dropped.
     ///
     /// # Examples
     ///
@@ -517,18 +509,25 @@ impl<T> Sender<T> {
 }
 
 impl<T: Clone> Sender<T> {
-    /// Broadcasts a message on the channel.
+    /// Broadcasts `msg` to every receiver.
     ///
-    /// If the channel is full, this method waits until there is space for a message, unless
-    /// overflow mode (set through [`Sender::set_overflow`]) is enabled, in which case it removes
-    /// the oldest message from the channel to make room for the new message. The removed message
-    /// is returned to the caller.
+    /// The returned future waits while the channel is full. It resolves to `Ok(None)` once the
+    /// message is sent. In overflow mode ([`Sender::set_overflow`]), a full channel does not make
+    /// it wait. It removes the oldest message to make room, and resolves to `Ok(Some(oldest))`.
     ///
-    /// If there are no active receivers, only inactive ones, this method waits until there is an
-    /// active one, unless [`Sender::set_await_active`] has turned that off, in which case it
-    /// resolves with a [`SendError`] immediately.
+    /// It also waits while there are only inactive receivers, until an active one exists. If
+    /// [`Sender::set_await_active`] turned that off, it fails immediately instead.
     ///
-    /// If the channel is closed, this method returns an error.
+    /// # Errors
+    ///
+    /// Fails with a [`SendError`], which holds the message, if:
+    ///
+    /// * The channel is closed.
+    /// * There are no active receivers and waiting for one is turned off.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it resolves does not send the message.
     ///
     /// # Examples
     ///
@@ -552,14 +551,19 @@ impl<T: Clone> Sender<T> {
         }
     }
 
-    /// Attempts to broadcast a message on the channel.
+    /// Broadcasts `msg` to every receiver without waiting.
     ///
-    /// If the channel is full, this method returns an error unless overflow mode (set through
-    /// [`Sender::set_overflow`]) is enabled. If the overflow mode is enabled, it removes the
-    /// oldest message from the channel to make room for the new message. The removed message
-    /// is returned to the caller.
+    /// Returns `Ok(None)` if the message is sent. In overflow mode ([`Sender::set_overflow`]), a
+    /// full channel is not an error. The oldest message is removed to make room and returned as
+    /// `Ok(Some(oldest))`.
     ///
-    /// If the channel is closed, this method returns an error.
+    /// # Errors
+    ///
+    /// Each error holds the message that was not sent:
+    ///
+    /// * [`TrySendError::Closed`] if the channel is closed.
+    /// * [`TrySendError::Inactive`] if there are only inactive receivers.
+    /// * [`TrySendError::Full`] if the channel is full and overflow mode is off.
     ///
     /// # Examples
     ///
@@ -633,12 +637,16 @@ impl<T> Clone for Sender<T> {
     }
 }
 
-/// The receiving side of a channel.
+/// The receiving side of a broadcast channel.
 ///
-/// Receivers can be cloned and shared among threads. When all (active) receivers associated with a
-/// channel are dropped, the channel becomes closed. You can deactivate a receiver using
-/// [`Receiver::deactivate`] if you would like the channel to remain open without keeping active
-/// receivers around.
+/// Receivers can be cloned and shared among threads. The channel closes when all its receivers are
+/// dropped, unless an [`InactiveReceiver`] still exists. To keep the channel open without being
+/// able to receive, call [`Receiver::deactivate`].
+///
+/// `Receiver` implements [`Stream`]. The stream yields each message, silently skips messages that
+/// it missed because they were dropped, and ends once the channel is closed and no messages are
+/// left. To learn about missed messages, use [`Receiver::recv`], [`Receiver::try_recv`] or
+/// [`Receiver::poll_recv`].
 #[derive(Debug)]
 pub struct Receiver<T> {
     channel: Arc<Channel<T>>,
@@ -664,11 +672,11 @@ impl<T> Receiver<T> {
         lock(&self.channel.inner).capacity
     }
 
-    /// Sets the channel capacity.
+    /// Sets the capacity of the channel.
     ///
-    /// There are times when you need to change the channel's capacity after creating it. If the
-    /// `new_cap` is less than the number of messages in the channel, the oldest messages will be
-    /// dropped to shrink the channel.
+    /// If `new_cap` is less than the number of messages in the channel, the oldest messages are
+    /// dropped to fit. A receiver that had not received them gets [`RecvError::Overflowed`] or
+    /// [`TryRecvError::Overflowed`].
     ///
     /// # Examples
     ///
@@ -714,10 +722,12 @@ impl<T> Receiver<T> {
         lock(&self.channel.inner).overflow
     }
 
-    /// Sets overflow mode on the channel.
+    /// Turns overflow mode on or off. It is off by default.
     ///
-    /// When overflow mode is set, broadcasting to the channel will succeed even if the channel is
-    /// full. It achieves that by removing the oldest message from the channel.
+    /// In overflow mode, broadcasting to a full channel succeeds. The oldest message is removed to
+    /// make room and returned to the caller. A receiver that had not received the removed message
+    /// gets [`RecvError::Overflowed`] or [`TryRecvError::Overflowed`]. Turning overflow mode on
+    /// also releases senders that are waiting for room: they send their message.
     ///
     /// # Examples
     ///
@@ -742,10 +752,10 @@ impl<T> Receiver<T> {
         self.channel.set_overflow(overflow);
     }
 
-    /// Whether senders wait for active receivers.
+    /// Whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If `false`, [`Sender::broadcast`] fails with a [`SendError`] instead.
     ///
     /// # Examples
     ///
@@ -760,10 +770,11 @@ impl<T> Receiver<T> {
         lock(&self.channel.inner).await_active
     }
 
-    /// Sets whether senders wait for active receivers.
+    /// Sets whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If set to `false`, [`Sender::broadcast`] fails with a [`SendError`] as soon as there is no
+    /// active receiver. This includes senders that are already waiting for one.
     ///
     /// # Examples
     ///
@@ -788,9 +799,9 @@ impl<T> Receiver<T> {
 
     /// Closes the channel.
     ///
-    /// Returns `true` if this call has closed the channel and it was not closed already.
+    /// Returns `true` if this call closed the channel, and `false` if it was already closed.
     ///
-    /// The remaining messages can still be received.
+    /// Receivers can still receive the messages that are left.
     ///
     /// # Examples
     ///
@@ -894,10 +905,9 @@ impl<T> Receiver<T> {
         lock(&self.channel.inner).queue.len()
     }
 
-    /// The number of receivers for the channel.
+    /// The number of active receivers.
     ///
-    /// This does not include inactive receivers. Use [`Receiver::inactive_receiver_count`] if you
-    /// are interested in that.
+    /// Inactive receivers are not counted. Use [`Receiver::inactive_receiver_count`] for those.
     ///
     /// # Examples
     ///
@@ -959,16 +969,15 @@ impl<T> Receiver<T> {
         lock(&self.channel.inner).sender_count
     }
 
-    /// Downgrades to an [`InactiveReceiver`].
+    /// Converts this receiver into an [`InactiveReceiver`].
     ///
-    /// An inactive receiver is one that can not and does not receive any messages. Its only purpose
-    /// is to keep the associated channel open even when there are no (active) receivers. An
-    /// inactive receiver can be upgraded into a [`Receiver`] using [`InactiveReceiver::activate`]
-    /// or [`InactiveReceiver::activate_cloned`].
+    /// An inactive receiver cannot receive messages. It only keeps the channel open when no active
+    /// receivers are left. Convert it back with [`InactiveReceiver::activate`] or
+    /// [`InactiveReceiver::activate_cloned`].
     ///
-    /// [`Sender::try_broadcast`] will return [`TrySendError::Inactive`] if only inactive
-    /// receivers exist for the associated channel and [`Sender::broadcast`] will wait until an
-    /// active receiver is available.
+    /// While only inactive receivers exist, [`Sender::try_broadcast`] fails with
+    /// [`TrySendError::Inactive`]. [`Sender::broadcast`] waits for an active receiver, unless
+    /// [`Sender::set_await_active`] turned that off.
     ///
     /// # Examples
     ///
@@ -997,21 +1006,24 @@ impl<T> Receiver<T> {
 }
 
 impl<T: Clone> Receiver<T> {
-    /// Receives a message from the channel.
+    /// Receives the next message for this receiver, waiting for one if there is none.
     ///
-    /// If there is no message for this receiver yet, this method waits until there is one or the
-    /// channel is closed.
+    /// # Errors
     ///
-    /// If the channel is closed, this method still receives the messages that are left for this
-    /// receiver, and returns [`RecvError::Closed`] once there are none.
+    /// * [`RecvError::Closed`] if the channel is closed and no messages are left for this receiver.
+    ///   A closed channel still delivers the messages that are left.
+    /// * [`RecvError::Overflowed`] if messages were dropped from the channel before this receiver
+    ///   got to them, in overflow mode or after a capacity reduction. It holds the number of missed
+    ///   messages. The receiver then continues from the oldest message still in the channel.
     ///
-    /// If this receiver has missed messages, because they were dropped from the channel before it
-    /// got to them (in overflow mode, or by a reduction of the capacity), this method returns
-    /// [`RecvError::Overflowed`] and readjusts its cursor to point to the first available
-    /// message.
+    /// # Panics
     ///
-    /// A clone of the message that panics loses this receiver that message; the panic reaches the
-    /// caller, and the channel stays usable.
+    /// Panics if `T::clone` panics. This receiver loses that message, the panic reaches the caller,
+    /// and the channel stays usable.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it resolves loses no message.
     ///
     /// # Examples
     ///
@@ -1039,19 +1051,23 @@ impl<T: Clone> Receiver<T> {
         }
     }
 
-    /// Attempts to receive a message from the channel.
+    /// Receives the next message for this receiver without waiting.
     ///
-    /// If there is no message for this receiver, this method returns an error:
-    /// [`TryRecvError::Closed`] if the channel is closed, and [`TryRecvError::Empty`] otherwise. A
-    /// closed channel still hands out the messages that are left for this receiver.
+    /// # Errors
     ///
-    /// If this receiver has missed messages, because they were dropped from the channel before it
-    /// got to them (in overflow mode, or by a reduction of the capacity), this method returns
-    /// [`TryRecvError::Overflowed`] and readjusts its cursor to point to the first available
-    /// message.
+    /// * [`TryRecvError::Empty`] if there is no message for this receiver yet and the channel is
+    ///   not closed.
+    /// * [`TryRecvError::Closed`] if the channel is closed and no messages are left for this
+    ///   receiver. A closed channel still delivers the messages that are left.
+    /// * [`TryRecvError::Overflowed`] if messages were dropped from the channel before this
+    ///   receiver got to them, in overflow mode or after a capacity reduction. It holds the number
+    ///   of missed messages. The receiver then continues from the oldest message still in the
+    ///   channel.
     ///
-    /// A clone of the message that panics loses this receiver that message; the panic reaches the
-    /// caller, and the channel stays usable.
+    /// # Panics
+    ///
+    /// Panics if `T::clone` panics. This receiver loses that message, the panic reaches the caller,
+    /// and the channel stays usable.
     ///
     /// # Examples
     ///
@@ -1096,7 +1112,7 @@ impl<T: Clone> Receiver<T> {
 
     /// Creates a new [`Sender`] for this channel.
     ///
-    /// This will not re-open the channel if it was closed due to all senders being dropped.
+    /// This does not reopen a channel that closed because all its senders were dropped.
     ///
     /// # Examples
     ///
@@ -1130,8 +1146,8 @@ impl<T: Clone> Receiver<T> {
 
     /// Creates a new [`Receiver`] for this channel.
     ///
-    /// Unlike [`Receiver::clone`], this method creates a new receiver that starts with zero
-    /// messages available. This is slightly faster than a real clone.
+    /// Unlike [`Receiver::clone`], the new receiver starts with no messages available. This is
+    /// slightly faster than a real clone.
     ///
     /// # Examples
     ///
@@ -1161,24 +1177,29 @@ impl<T: Clone> Receiver<T> {
         self.channel.new_receiver()
     }
 
-    /// A low level poll method that is similar to [`Receiver::recv()`], and can be useful for
-    /// building stream implementations which use a [`Receiver`] under the hood and want to know if
-    /// the stream has overflowed.
+    /// Polls for the next message for this receiver.
     ///
-    /// Prefer to use [`Receiver::recv()`] when otherwise possible.
+    /// This is [`Receiver::recv`] as a poll method. It is useful for stream implementations built
+    /// on a [`Receiver`] that need to know about overflow. Prefer [`Receiver::recv`] otherwise.
     ///
-    /// # Errors
+    /// The result is:
     ///
-    /// If messages were dropped from the channel before this receiver got to them (in overflow
-    /// mode, or by a reduction of the capacity), a [`RecvError::Overflowed`] variant is returned
-    /// containing the number of messages that were lost.
+    /// * `Poll::Ready(Some(Ok(msg)))` for a message.
+    /// * `Poll::Ready(Some(Err(RecvError::Overflowed(n))))` if `n` messages were dropped before
+    ///   this receiver got to them. The receiver then continues from the oldest message still in
+    ///   the channel.
+    /// * `Poll::Ready(None)` if the channel is closed and no messages are left for this receiver. A
+    ///   closed channel is never reported as `Err(RecvError::Closed)`.
+    /// * `Poll::Pending` otherwise. The task is woken when a message arrives or the channel closes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `T::clone` panics, as [`Receiver::try_recv`] does.
     ///
     /// # Examples
     ///
-    /// This example shows how the [`Receiver::poll_recv`] method can be used to allow a custom
-    /// stream implementation to internally make use of a [`Receiver`]. This example implementation
-    /// differs from the stream implementation of [`Receiver`] because it returns an error if
-    /// the channel capacity overflows, which the built in [`Receiver`] stream doesn't do.
+    /// A stream built on a [`Receiver`] with [`Receiver::poll_recv`]. Unlike the `Stream`
+    /// implementation of [`Receiver`], which skips missed messages, it reports them as an error.
     ///
     /// ```
     /// use std::{
@@ -1299,7 +1320,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T> Clone for Receiver<T> {
-    /// Produces a clone of this [`Receiver`] that has the same messages queued.
+    /// Creates a [`Receiver`] that has the same messages queued as this one.
     ///
     /// # Examples
     ///
@@ -1364,19 +1385,20 @@ impl<T: Clone> futures_core::stream::FusedStream for Receiver<T> {
     }
 }
 
-/// An inactive receiver.
+/// A receiver that cannot receive messages.
 ///
-/// An inactive receiver is a receiver that is unable to receive messages. It's only useful for
-/// keeping a channel open even when no associated active receivers exist.
+/// An inactive receiver only keeps the channel open when no active receivers exist. Create one with
+/// [`Receiver::deactivate`].
 #[derive(Debug)]
 pub struct InactiveReceiver<T> {
     channel: Arc<Channel<T>>,
 }
 
 impl<T> InactiveReceiver<T> {
-    /// Converts to an active [`Receiver`].
+    /// Converts this inactive receiver into an active [`Receiver`].
     ///
-    /// Consumes `self`. Use [`InactiveReceiver::activate_cloned`] if you want to keep `self`.
+    /// The receiver starts with no messages available. This consumes `self`. Use
+    /// [`InactiveReceiver::activate_cloned`] to keep `self`.
     ///
     /// # Examples
     ///
@@ -1396,7 +1418,9 @@ impl<T> InactiveReceiver<T> {
         self.activate_cloned()
     }
 
-    /// Creates an active [`Receiver`] for the associated channel.
+    /// Creates an active [`Receiver`] for the channel.
+    ///
+    /// The receiver starts with no messages available.
     ///
     /// # Examples
     ///
@@ -1418,43 +1442,45 @@ impl<T> InactiveReceiver<T> {
 
     /// The channel's capacity.
     ///
-    /// See [`Receiver::capacity`] documentation for examples.
+    /// See [`Receiver::capacity`] for examples.
     pub fn capacity(&self) -> NonZeroUsize {
         lock(&self.channel.inner).capacity
     }
 
-    /// Sets the channel capacity.
+    /// Sets the capacity of the channel.
     ///
-    /// There are times when you need to change the channel's capacity after creating it. If the
-    /// `new_cap` is less than the number of messages in the channel, the oldest messages will be
-    /// dropped to shrink the channel.
+    /// If `new_cap` is less than the number of messages in the channel, the oldest messages are
+    /// dropped to fit. A receiver that had not received them gets [`RecvError::Overflowed`] or
+    /// [`TryRecvError::Overflowed`].
     ///
-    /// See [`Receiver::set_capacity`] documentation for examples.
+    /// See [`Receiver::set_capacity`] for examples.
     pub fn set_capacity(&mut self, new_cap: NonZeroUsize) {
         self.channel.set_capacity(new_cap);
     }
 
     /// Whether overflow mode is enabled on this channel.
     ///
-    /// See [`Receiver::overflow`] documentation for examples.
+    /// See [`Receiver::overflow`] for examples.
     pub fn overflow(&self) -> bool {
         lock(&self.channel.inner).overflow
     }
 
-    /// Sets overflow mode on the channel.
+    /// Turns overflow mode on or off. It is off by default.
     ///
-    /// When overflow mode is set, broadcasting to the channel will succeed even if the channel is
-    /// full. It achieves that by removing the oldest message from the channel.
+    /// In overflow mode, broadcasting to a full channel succeeds. The oldest message is removed to
+    /// make room and returned to the caller. A receiver that had not received the removed message
+    /// gets [`RecvError::Overflowed`] or [`TryRecvError::Overflowed`]. Turning overflow mode on
+    /// also releases senders that are waiting for room: they send their message.
     ///
-    /// See [`Receiver::set_overflow`] documentation for examples.
+    /// See [`Receiver::set_overflow`] for examples.
     pub fn set_overflow(&mut self, overflow: bool) {
         self.channel.set_overflow(overflow);
     }
 
-    /// Whether senders wait for active receivers.
+    /// Whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If `false`, [`Sender::broadcast`] fails with a [`SendError`] instead.
     ///
     /// # Examples
     ///
@@ -1470,10 +1496,11 @@ impl<T> InactiveReceiver<T> {
         lock(&self.channel.inner).await_active
     }
 
-    /// Sets whether senders wait for active receivers.
+    /// Sets whether [`Sender::broadcast`] waits when there are no active receivers. The default is
+    /// `true`.
     ///
-    /// If set to `false`, [`Send`] will resolve immediately with a [`SendError`] when there are no
-    /// active receivers. Defaults to `true`.
+    /// If set to `false`, [`Sender::broadcast`] fails with a [`SendError`] as soon as there is no
+    /// active receiver. This includes senders that are already waiting for one.
     ///
     /// # Examples
     ///
@@ -1497,32 +1524,32 @@ impl<T> InactiveReceiver<T> {
 
     /// Closes the channel.
     ///
-    /// Returns `true` if this call has closed the channel and it was not closed already.
+    /// Returns `true` if this call closed the channel, and `false` if it was already closed.
     ///
-    /// The remaining messages can still be received.
+    /// Receivers can still receive the messages that are left.
     ///
-    /// See [`Receiver::close`] documentation for examples.
+    /// See [`Receiver::close`] for examples.
     pub fn close(&self) -> bool {
         self.channel.close()
     }
 
     /// Whether the channel is closed.
     ///
-    /// See [`Receiver::is_closed`] documentation for examples.
+    /// See [`Receiver::is_closed`] for examples.
     pub fn is_closed(&self) -> bool {
         lock(&self.channel.inner).is_closed
     }
 
     /// Whether the channel is empty.
     ///
-    /// See [`Receiver::is_empty`] documentation for examples.
+    /// See [`Receiver::is_empty`] for examples.
     pub fn is_empty(&self) -> bool {
         lock(&self.channel.inner).queue.is_empty()
     }
 
     /// Whether the channel is full.
     ///
-    /// See [`Receiver::is_full`] documentation for examples.
+    /// See [`Receiver::is_full`] for examples.
     pub fn is_full(&self) -> bool {
         let inner = lock(&self.channel.inner);
 
@@ -1531,15 +1558,15 @@ impl<T> InactiveReceiver<T> {
 
     /// The number of messages in the channel.
     ///
-    /// See [`Receiver::len`] documentation for examples.
+    /// See [`Receiver::len`] for examples.
     pub fn len(&self) -> usize {
         lock(&self.channel.inner).queue.len()
     }
 
-    /// The number of receivers for the channel.
+    /// The number of active receivers.
     ///
-    /// This does not include inactive receivers. Use [`InactiveReceiver::inactive_receiver_count`]
-    /// if you're interested in that.
+    /// Inactive receivers are not counted. Use [`InactiveReceiver::inactive_receiver_count`] for
+    /// those.
     ///
     /// # Examples
     ///
@@ -1583,7 +1610,7 @@ impl<T> InactiveReceiver<T> {
 
     /// The number of senders for the channel.
     ///
-    /// See [`Receiver::sender_count`] documentation for examples.
+    /// See [`Receiver::sender_count`] for examples.
     pub fn sender_count(&self) -> usize {
         lock(&self.channel.inner).sender_count
     }
@@ -1615,7 +1642,7 @@ impl<T> Drop for InactiveReceiver<T> {
     }
 }
 
-/// A future returned by [`Sender::broadcast()`].
+/// The future returned by [`Sender::broadcast`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Send<'a, T> {
@@ -1693,7 +1720,7 @@ impl<T: Clone> Future for Send<'_, T> {
     }
 }
 
-/// A future returned by [`Receiver::recv()`].
+/// The future returned by [`Receiver::recv`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Recv<'a, T> {
@@ -1734,15 +1761,15 @@ impl<T: Clone> Future for Recv<'_, T> {
     }
 }
 
-/// An error returned from [`Sender::broadcast()`].
+/// The error returned by [`Sender::broadcast`]. It holds the message that was not sent.
 ///
-/// Received because the channel is closed, or because no active receivers were present while
-/// `await_active` was set to `false` (see [`Sender::set_await_active`] for details).
+/// It means that the channel is closed, or that there are no active receivers and
+/// [`Sender::set_await_active`] turned off waiting for one.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SendError<T>(pub T);
 
 impl<T> SendError<T> {
-    /// Unwraps the message that couldn't be sent.
+    /// Returns the message that was not sent.
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -1762,21 +1789,22 @@ impl<T> fmt::Display for SendError<T> {
     }
 }
 
-/// An error returned from [`Sender::try_broadcast()`].
+/// The error returned by [`Sender::try_broadcast`]. Each variant holds the message that was not
+/// sent.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum TrySendError<T> {
-    /// The channel is full but not closed.
+    /// The channel is full and overflow mode is off.
     Full(T),
 
     /// The channel is closed.
     Closed(T),
 
-    /// There are currently no active receivers, only inactive ones.
+    /// There are no active receivers, only inactive ones.
     Inactive(T),
 }
 
 impl<T> TrySendError<T> {
-    /// Unwraps the message that couldn't be sent.
+    /// Returns the message that was not sent.
     pub fn into_inner(self) -> T {
         match self {
             TrySendError::Full(t) => t,
@@ -1785,7 +1813,7 @@ impl<T> TrySendError<T> {
         }
     }
 
-    /// Whether the channel is full but not closed.
+    /// Whether the error is [`TrySendError::Full`].
     pub fn is_full(&self) -> bool {
         match self {
             TrySendError::Full(_) => true,
@@ -1793,7 +1821,7 @@ impl<T> TrySendError<T> {
         }
     }
 
-    /// Whether the channel is closed.
+    /// Whether the error is [`TrySendError::Closed`].
     pub fn is_closed(&self) -> bool {
         match self {
             TrySendError::Full(_) | TrySendError::Inactive(_) => false,
@@ -1801,7 +1829,7 @@ impl<T> TrySendError<T> {
         }
     }
 
-    /// Whether there are currently no active receivers, only inactive ones.
+    /// Whether the error is [`TrySendError::Inactive`]: there are no active receivers.
     pub fn is_disconnected(&self) -> bool {
         match self {
             TrySendError::Full(_) | TrySendError::Closed(_) => false,
@@ -1832,14 +1860,14 @@ impl<T> fmt::Display for TrySendError<T> {
     }
 }
 
-/// An error returned from [`Receiver::recv()`].
+/// The error returned by [`Receiver::recv`].
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum RecvError {
-    /// Messages were dropped from the channel before this receiver got to them, in overflow mode
-    /// or by a reduction of the capacity. Future recv operations will succeed, but some messages
-    /// have been skipped.
+    /// Messages were dropped from the channel before this receiver got to them, in overflow mode or
+    /// after a capacity reduction.
     ///
-    /// Contains the number of messages missed.
+    /// Holds the number of messages missed. The receiver continues from the oldest message still in
+    /// the channel.
     Overflowed(u64),
 
     /// The channel is closed and has no messages left for this receiver.
@@ -1857,14 +1885,14 @@ impl fmt::Display for RecvError {
     }
 }
 
-/// An error returned from [`Receiver::try_recv()`].
+/// The error returned by [`Receiver::try_recv`].
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum TryRecvError {
-    /// Messages were dropped from the channel before this receiver got to them, in overflow mode
-    /// or by a reduction of the capacity. Future recv operations will succeed, but some messages
-    /// have been skipped.
+    /// Messages were dropped from the channel before this receiver got to them, in overflow mode or
+    /// after a capacity reduction.
     ///
-    /// Contains the number of messages missed.
+    /// Holds the number of messages missed. The receiver continues from the oldest message still in
+    /// the channel.
     Overflowed(u64),
 
     /// There is no message for this receiver yet, and the channel is not closed.
@@ -1875,7 +1903,7 @@ pub enum TryRecvError {
 }
 
 impl TryRecvError {
-    /// Whether there is no message for this receiver yet, and the channel is not closed.
+    /// Whether the error is [`TryRecvError::Empty`].
     pub fn is_empty(&self) -> bool {
         match self {
             TryRecvError::Empty => true,
@@ -1884,7 +1912,7 @@ impl TryRecvError {
         }
     }
 
-    /// Whether the channel is closed and has no messages left for this receiver.
+    /// Whether the error is [`TryRecvError::Closed`].
     pub fn is_closed(&self) -> bool {
         match self {
             TryRecvError::Empty => false,
@@ -1893,7 +1921,7 @@ impl TryRecvError {
         }
     }
 
-    /// Whether this error indicates the receiver missed messages.
+    /// Whether the error is [`TryRecvError::Overflowed`]: the receiver missed messages.
     pub fn is_overflowed(&self) -> bool {
         match self {
             TryRecvError::Empty => false,
