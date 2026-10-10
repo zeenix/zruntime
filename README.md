@@ -5,22 +5,29 @@
 [![](https://img.shields.io/crates/v/zruntime)](https://crates.io/crates/zruntime)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/zruntime?utm_source=badge)
 
-A simple, single-threaded Rust async runtime. A [`Runtime`] is an owned value made of:
+A simple, single-threaded async runtime for Rust.
 
-* a scheduler that holds tasks and hands them out to be polled,
-* a reactor that watches registered I/O sources and keeps timers, waiting on epoll on Linux and
-  Android, kqueue on the BSDs, `select` on Apple's platforms and Windows, and `poll(2)` on any other
-  unix, and
-* [`Runtime::block_on`] to drive a future to completion on the calling thread.
+A [`Runtime`] has a scheduler, which runs tasks, and a reactor, which watches I/O sources and
+keeps timers. [`Runtime::block_on`] runs a future to completion on the calling thread. While it
+waits for the future, the same thread also runs the runtime's tasks, timers and I/O.
 
-It comes in two flavours. [`LocalRuntime`] is the default one: it stays on the thread it was made on, runs any
-`'static` future, and holds its state in `Rc` and `RefCell` rather than behind atomics and locks.
-[`SharedRuntime`] may be reached from, and driven on, any thread, at the cost of `Send` futures
-and state kept in `Arc` and `Mutex`.
+The reactor waits on epoll on Linux and Android, kqueue on the BSDs, `select` on Apple platforms
+and Windows, and `poll(2)` on other unix systems.
 
-## Example
+A runtime comes in one of two flavours:
 
-A local runtime, used by the thread that made it:
+* [`LocalRuntime`] is the default. It stays on the thread that created it and runs any `'static`
+  future. It keeps its state in `Rc` and `RefCell`, which makes it the cheaper of the two.
+* [`SharedRuntime`] can be used from, and run on, any thread. It only runs `Send` futures, and
+  keeps its state in `Arc` and `Mutex`.
+
+Besides the runtime, the crate has async sockets, child processes, filesystem access and a thread
+pool for blocking work. It also has an event, locks and channels that work under any executor.
+Most of these are behind [cargo features](#cargo-features).
+
+## Examples
+
+A local runtime, used by the thread that created it:
 
 ```rust
 use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -46,7 +53,7 @@ let doubled = runtime.block_on(async {
 assert_eq!(doubled, 42);
 ```
 
-A shared runtime, reached from another thread while the main thread drives it:
+A shared runtime, spawned on from another thread while the main thread runs it:
 
 ```rust
 use std::{sync::mpsc, thread};
@@ -70,18 +77,55 @@ spawner.join().expect("the other thread did not panic");
 assert_eq!(doubled, 42);
 ```
 
-`Runtime::new()` alone cannot tell which flavour to build, so reach for one of [`LocalRuntime`]
-or [`SharedRuntime`] instead of naming [`Runtime`] directly.
+Create a runtime with `LocalRuntime::new()` or `SharedRuntime::new()`. The compiler cannot infer
+the flavour of a plain `Runtime::new()`.
 
-A future built from several tasks, timers and registered sockets runs the same way: `block_on`
-drives all of it on the calling thread.
+## Tasks
+
+[`Runtime::spawn`] starts a task on that runtime. It takes a name, which the log message uses if
+the task panics.
+
+Code that has no runtime handle can use the free [`spawn_local`] and [`spawn`] functions instead.
+They spawn on the runtime that is running the calling code, and name the task after the place it
+was spawned from.
+
+```rust
+use zruntime::{LocalRuntime, Task};
+
+// Has no runtime handle: it spawns on the runtime that runs its caller.
+fn double(number: u32) -> Task<u32> {
+    zruntime::spawn_local(async move { number * 2 })
+}
+
+let runtime = LocalRuntime::new().expect("a runtime for this thread");
+let doubled = runtime.block_on(async { double(21).await.expect("the task did not panic") });
+
+assert_eq!(doubled, 42);
+```
+
+* [`spawn_local`] takes any `'static` future. Call it from code running on a [`LocalRuntime`]:
+  from the future passed to its `block_on`, or from one of its tasks.
+* [`spawn`] takes a `Send` future, and spawns it on the [`SharedRuntime`] that runs the calling
+  code. If there is none, it panics, unless the `helper` feature is on (see
+  [Per-thread runtimes](#per-thread-runtimes)).
+
+Both return a [`Task`], the handle of the task:
+
+* Awaiting it returns the task's output, or an error if the task panicked or its runtime was
+  dropped.
+* Dropping it cancels the task.
+* [`Task::cancel`] cancels the task and waits until it has stopped. If the task had already
+  finished, it returns the output.
+* [`Task::detach`] lets the task run on without a handle.
+* [`Task::is_finished`] tells whether the task has ended, without taking its output.
 
 ## Timers
 
-[`Runtime::sleep`] waits for a length of time and [`Runtime::sleep_until`] for a moment on the
-clock, which keeps a loop to a schedule without drift, and a [`Sleep`] can be pushed back in place
-with [`Sleep::reset`], as a keep-alive or an idle timeout is on every message. [`Runtime::timeout`]
-gives any future a time limit, and [`Runtime::interval`] ticks once every period, as a stream:
+* [`Runtime::sleep`] waits for a duration, and [`Runtime::sleep_until`] waits until a deadline. A
+  loop that sleeps until deadlines keeps to its schedule without drifting.
+* [`Sleep::reset`] moves the deadline of a sleep, for example to restart an idle timeout.
+* [`Runtime::timeout`] puts a time limit on any future.
+* [`Runtime::interval`] ticks once every period. It is also a `Stream`.
 
 ```rust
 use std::{future, time::Duration};
@@ -100,154 +144,136 @@ runtime.block_on(async {
 });
 ```
 
-## Spawning
-
-[`Runtime::spawn`] puts a task on the runtime it is called on, under a name that the message logged
-if the task panics goes by. Code that has no runtime to call it on, because it was never handed
-one, spawns with the free [`spawn`] or [`spawn_local`] instead: the task goes on the runtime that is
-running the calling code, whichever it is, and is named by where it was spawned.
-
-```rust
-use zruntime::{LocalRuntime, Task};
-
-// Handed no runtime, and needing none: it spawns on whichever one is running its caller.
-fn double(number: u32) -> Task<u32> {
-    zruntime::spawn_local(async move { number * 2 })
-}
-
-let runtime = LocalRuntime::new().expect("a runtime for this thread");
-let doubled = runtime.block_on(async { double(21).await.expect("the task did not panic") });
-
-assert_eq!(doubled, 42);
-```
-
-[`spawn_local`] takes any `'static` future and needs the calling thread to be inside a
-[`LocalRuntime::block_on`], or in one of its tasks. [`spawn`] takes a `Send` future for the
-[`SharedRuntime`] the calling thread drives; where it drives none, it panics, unless the `helper`
-feature, described below, is there to give it a runtime to spawn on.
-
-The [`Task`] either hands back is what joins the task, by being awaited. Dropping it cancels the
-task, and [`Task::cancel`] cancels it and waits until it has stopped, handing back its output where
-it had finished already. [`Task::detach`] lets it run on unobserved, and [`Task::is_finished`] tells
-whether it has ended without polling it or taking its output.
-
-## The `helper` feature
-
-The examples above each drive their runtime with one `block_on` call. A library whose
-futures may be polled from another executor, or that calls `block_on` once per operation rather
-than once for the whole program — [zbus], say — needs a runtime that keeps running in between
-those calls instead of standing still until the next one.
-
-The non-default `helper` feature adds that: [`SharedRuntime::current`] hands out a runtime for
-the calling thread (its own where the thread is inside a `block_on`, one shared by the whole
-process otherwise), and the free [`block_on`] drives it. Work that outlives every `block_on`
-call is picked up by a helper thread, started the moment such work is found with nobody driving
-the runtime, and put down once nothing is left to run, watch or time. A `block_on` call that
-arrives while the helper holds the runtime is handed it straight away, so a program calling
-`block_on` once per operation still runs each of them on its own thread rather than behind a
-thread of the runtime's own. With it, [`spawn`] has a runtime to go on from any thread: where the
-calling thread drives none, the task goes on the one [`SharedRuntime::current`] hands out.
-
-## Running on several threads
-
-A runtime is driven by one thread at a time: the one inside `block_on` on it or, for a runtime
-the `helper` feature hands out, its helper thread while nobody is. All of its tasks share that
-thread, so a task that keeps the CPU busy holds up every other task on the same runtime. Nor can
-two threads drive one runtime together: a second `block_on` on a [`SharedRuntime`] made by
-`SharedRuntime::new` panics while another thread is inside one, and a second one on a runtime from
-[`SharedRuntime::current`] waits for its turn.
-
-Work that needs more than one core runs on several runtimes instead, one per thread, each driven
-by a `block_on` of its own, in parallel with the others. With the `helper` feature, the free
-[`block_on`] already works this way: each thread that calls it drives a runtime of its own. An
-[`mpmc`] channel, behind the non-default feature of that name, spreads the work over the threads:
-each of them waits for the next piece of work on a clone of the same receiver, and each piece goes
-to one of them, whichever is free to take it first, as [the module's example] shows. [`Event`],
-the channels and the locks of this crate all work across runtimes and threads, as they work under
-any executor, so tasks on different runtimes can share them. To put a task on a thread of its
-choosing, a program spawns it on that thread's runtime instead: a [`SharedRuntime`] can be spawned
-on from any thread, as the second example above shows.
-
 ## Sockets
 
-The non-default `tcp`, `udp` and `unix` features add ready-made async sockets, as smol has in
-`smol::net`: the [`net`] module's `TcpListener`, `TcpStream` and `UdpSocket`, and on unix its
-`unix` module's `UnixListener`, `UnixStream` and `UnixDatagram`, all of which run on a runtime of
-either flavour. A stream implements the `AsyncRead` and `AsyncWrite` traits of `futures-io`, and
-connecting it never blocks the thread. The TCP and UDP sockets take socket addresses rather than
-host names: a name is the caller's to look up, which the `unblock` feature can do off the thread.
+The [`net`] module has TCP and UDP sockets: `TcpListener`, `TcpStream` and `UdpSocket`. On unix,
+its `unix` module has `UnixListener`, `UnixStream` and `UnixDatagram`. They are like the sockets of
+`smol::net`, and work on both flavours of runtime. Streams implement `AsyncRead` and `AsyncWrite`
+from `futures-io`. Connecting never blocks the thread.
 
-## Other sources
+The sockets take socket addresses, not host names. To look up a name without blocking the thread,
+run the lookup with [`unblock`].
 
-[`AsyncIo`] wraps any source the runtime can watch, as smol has in `smol::Async`. On unix that is
-anything with a file descriptor: a pipe, a terminal, an eventfd, an inotify instance, the standard
-I/O of a child process, or a socket of a type the [`net`] module has none for. On Windows it is a
-socket, and nothing else. [`AsyncIo::readable`] and [`AsyncIo::writable`] wait for readiness alone,
-to hand the descriptor to a library that does its own I/O, and [`AsyncIo::read_with`] and
-[`AsyncIo::write_with`] run an operation on the source until it stops reporting `WouldBlock`. Any
-number of tasks may wait at once through these four. The `AsyncRead` and `AsyncWrite` traits of
-`futures-io`, which [`AsyncIo`] implements wherever `&T` implements `Read` or `Write`, keep one
-waiting task per direction instead. [`Runtime::register`] and [`Registration`] are the lower level
-it is built on.
+## Other I/O sources
+
+[`AsyncIo`] makes any source the reactor can watch async, like `smol::Async`. On unix, that is
+anything with a file descriptor: a pipe, a terminal, an eventfd, an inotify instance, or a socket
+type that [`net`] does not cover. On Windows, it can only be a socket.
+
+* [`AsyncIo::read_with`] and [`AsyncIo::write_with`] run an operation on the source until it no
+  longer fails with `WouldBlock`.
+* [`AsyncIo::readable`] and [`AsyncIo::writable`] only wait for readiness. They are useful when
+  another library does the I/O on the descriptor.
+* `AsyncIo<T>` implements `AsyncRead` from `futures-io` if `&T` implements `Read`, and
+  `AsyncWrite` if `&T` implements `Write`.
+
+Any number of tasks can wait through these four methods at once. The `AsyncRead` and `AsyncWrite`
+impls keep only one waiting task per direction.
+
+`AsyncIo` is built on [`Runtime::register`] and [`Registration`], which are public too.
+
+`AsyncIo` is not for regular files: reading or writing one can block the thread, whatever its
+readiness says. Use [`Unblock`] or the [`fs`] module for files.
+
+## Blocking work and files
+
+[`unblock`] runs blocking work on a pool of threads, and returns a future of its result.
+[`Unblock`] wraps a blocking I/O handle, such as a file or the standard input. It implements the
+async I/O traits by running each operation on that pool.
+
+The [`fs`] module is async filesystem access, in the shape of `std::fs` and like `smol::fs`. It
+runs each operation on the same pool.
+
+None of these needs a runtime: they work under any executor.
 
 ## Child processes
 
-The non-default `process` feature adds async child processes, in the shape of `std::process` and of
-smol's `smol::process`: the [`process`] module's `Command` is built as `std::process::Command` is,
-and spawns the program on a runtime of either flavour, which it is handed, as a `Child` whose
-`status` and `output` are futures. A child's standard input, output and error come out of it as
-`ChildStdin`, `ChildStdout` and `ChildStderr`, which implement the `AsyncWrite` and `AsyncRead`
-traits of `futures-io`. On unix the runtime watches these pipes itself, so that reading and
-writing them never blocks the thread; on Windows they run as blocking work on [`unblock`]'s pool
-instead. `output` reads the standard output and the standard error together, so that a child
-which fills the one while nobody reads the other does not stall. A pipe can be handed on to
-another child, to run `a | b`, through its `into_stdio`.
+The [`process`] module runs child processes, like `smol::process`. Its `Command` works like
+`std::process::Command`, but spawns the child on a runtime that you pass to it. The `Child` it
+returns has async `status` and `output` methods. The pipes to the child, `ChildStdin`,
+`ChildStdout` and `ChildStderr`, implement `AsyncWrite` and `AsyncRead`.
 
-Waiting for a child to exit does not block the thread either. Where the runtime can watch for the
-exit, which it can through a pidfd on Linux and through a kqueue of the child's own on Apple's
-platforms and the BSDs, it does; elsewhere, on Android, on Windows, on the other unix systems, and
-on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose sandbox turns the
-call away, the wait runs on a thread of a pool kept for the waits for children, and holds that
-thread until the child has exited. Dropping a `Child` leaves the process running, unless its
-`Command` was given `kill_on_drop(true)`. On unix, a child that is still running when it is let go
-of is reaped once it exits, from a thread of the same pool, so that it leaves no zombie behind;
-awaiting its `status` first, or `reap_on_drop(false)`, spares that thread. The pool, whose threads
-are named `zruntime child wait`, is apart from [`unblock`]'s, so a program that lets go of, or
-waits for, many long-running children never holds up the rest of its blocking work: it holds a
-thread for each of them, up to 500, past which the waits queue behind each other.
+On unix, the reactor watches the pipes. On Windows, their I/O runs on the [`unblock`] pool.
 
-## Events
+Waiting for a child to exit never blocks the thread. On Linux, Apple platforms and the BSDs, the
+reactor watches for the exit. Elsewhere, the wait runs on a separate pool of threads. Dropping a
+`Child` leaves the process running, unless `kill_on_drop(true)` was set on its `Command`. The
+[`process`] module documentation has the details.
 
-An [`Event`] is a notification that tasks can wait for. A task takes an [`EventListener`] from it
-and awaits that, and whoever changes what the task is waiting for — releases a lock, fills a
-queue, closes a connection — notifies the event, which wakes as many of the tasks listening as it
-is asked to, oldest first. It is what the waiting part of a lock, a channel or a connection is
-built on.
+## Events, locks and channels
 
-An event needs no runtime. A listener is a plain future, woken through the waker of whatever
-polled it last, so it works under any executor, and an event may be notified from any thread. It
-is behind the `event` feature, which builds without the runtime: see [Features](#features).
+These work under any executor, not only zruntime's. Tasks on different runtimes and threads can
+share them.
+
+* [`Event`] is a notification that tasks can wait for. A task gets an [`EventListener`] from the
+  event and awaits it. Code that changes what the task waits for, for example by releasing a lock,
+  notifies the event. That wakes as many listeners as it asks for, oldest first. The locks and
+  channels below are built on it.
+* The [`lock`] module has an async `Mutex`, `RwLock` and `Semaphore`, whose guards can be held
+  across an `.await`. It also has a `Barrier`, and a `OnceCell` whose initialiser can be async.
+* [`mpmc`] is a multi-producer, multi-consumer channel, bounded or unbounded. Each message goes to
+  one receiver.
+* [`broadcast`] is a multi-producer, multi-consumer broadcast channel. Each message goes to every
+  receiver.
+
+## Running on several threads
+
+One thread at a time runs a runtime, so all its tasks share one CPU core. A task that keeps the
+CPU busy holds up every other task on the same runtime.
+
+Two threads cannot run one runtime together. If a thread calls `block_on` on a [`SharedRuntime`]
+from `SharedRuntime::new` while another thread is running `block_on` on it, the call panics. On a
+runtime from [`SharedRuntime::current`], the call waits for its turn instead.
+
+To use more cores, use several runtimes, one per thread, each run by its own `block_on`. The free
+[`block_on`] already works like this: each thread that calls it runs its own runtime.
+
+To spread work over the threads, give each thread a clone of the same [`mpmc`] receiver. Each
+piece of work goes to whichever thread receives it first, as [the module's example] shows. To run
+a task on a specific thread, spawn it on that thread's runtime. A [`SharedRuntime`] can be spawned
+on from any thread, as the second example above shows.
+
+## Per-thread runtimes
+
+The examples above run their runtime with one `block_on` call for the whole program. Some code
+works differently. A library such as [zbus] may call `block_on` once per operation, or have its
+futures polled by another executor. Its tasks and timers must keep running between those calls.
+
+The `helper` feature supports this:
+
+* The free [`block_on`] runs a future on the calling thread's own runtime.
+* [`SharedRuntime::current`] returns the runtime for the calling code. Called from a task of such
+  a runtime, or from the future passed to `block_on` on one, it returns that runtime. Called from
+  the future passed to the free `block_on`, it returns the calling thread's own runtime. Called
+  anywhere else, it returns one runtime that the whole process shares.
+* If such a runtime has work to do and no thread is running `block_on` on it, a helper thread runs
+  it. The helper starts when needed, and stops once nothing is left to run, watch or time.
+* When a thread calls `block_on` while the helper is running the runtime, the helper hands the
+  runtime over to that thread. So each operation still runs on the thread that called `block_on`.
+* [`spawn`] works from any thread. If no shared runtime runs the calling code, the task goes on
+  the runtime that [`SharedRuntime::current`] returns.
 
 ## Combinators
 
-zruntime has no combinators of its own, and no `future`, `stream` and `io` modules of helpers such
-as smol's: those of the [`futures`] crate work with it. They are built on the `Future`, `Stream`,
-`AsyncRead` and `AsyncWrite` traits, which the tasks, timers, sockets, pipes and adapters of
-zruntime implement, so they work on a runtime of either flavour, as they work under any executor.
-[`futures::future`] joins and races futures, [`futures::stream`] adapts streams, such as an interval
-or the connections a listener takes, and [`futures::io`] gives whatever implements `AsyncRead` or
-`AsyncWrite` the likes of `read_to_end` and `write_all`, and a `BufReader` to read lines through.
+zruntime has no combinators of its own. Use those of the [`futures`] crate instead. They work with
+zruntime's tasks, timers, sockets and pipes, which implement the standard `Future`, `Stream`,
+`AsyncRead` and `AsyncWrite` traits.
 
-The default features of `futures` bring an executor, which a program that runs on zruntime has no
-need for, and the `join!` and `select!` macros, which build a proc-macro and the `syn` crate along
-with it. Leaving them out spares the build both:
+* [`futures::future`] joins and races futures.
+* [`futures::stream`] adapts streams, such as an interval or the connections of a listener.
+* [`futures::io`] adds methods such as `read_to_end` and `write_all`, and a `BufReader` to read
+  lines with.
+
+The default features of `futures` bring an executor, which you do not need with zruntime. They
+also bring the `join!` and `select!` macros, which build a proc-macro and the `syn` crate. To leave
+both out:
 
 ```toml
 [dependencies]
 futures = { version = "0.3", default-features = false, features = ["std"] }
 ```
 
-`std` brings the I/O extension traits, and `async-await` brings back the macros.
+`std` brings the I/O extension traits. Add `async-await` to get the macros back.
 
 ```rust
 use std::time::Duration;
@@ -257,7 +283,7 @@ use zruntime::LocalRuntime;
 
 let runtime = LocalRuntime::new().expect("a runtime for this thread");
 runtime.block_on(async {
-    // Two tasks after the same answer, one of which has it much sooner than the other.
+    // Two tasks after the same answer, one of them much faster than the other.
     let soon = runtime.clone();
     let near = runtime.spawn("near", async move {
         soon.sleep(Duration::from_millis(1)).await;
@@ -269,61 +295,40 @@ runtime.block_on(async {
         "far"
     });
 
-    // The first to answer wins. The other is handed back along with the answer, and dropping it
+    // The first to answer wins. The other one is returned with the answer, and dropping it
     // cancels it.
     let (answer, _) = future::select(near, far).await.factor_first();
     assert_eq!(answer.expect("the task did not panic"), "near");
 
-    // Two futures awaited together, the outputs of both kept.
+    // Two futures awaited together, keeping the outputs of both.
     let (a, b) = future::join(async { 21 }, async { 2 }).await;
     assert_eq!(a * b, 42);
 });
 ```
 
-A race against a timer is a time limit, which [`Runtime::timeout`] puts on any future in one call.
-The documentation of [`Unblock`] has an example of reading the standard input line by line,
-through such a `BufReader`.
+To race a future against a timer, use [`Runtime::timeout`]. The [`Unblock`] documentation shows
+how to read the standard input line by line through a `BufReader`.
 
-## Features
+## Cargo features
 
-* `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
-  timers and I/O registrations built on them, and [`AsyncIo`], the async handle of any source they
-  can watch; it brings the `futures-core` and `futures-io` crates.
-* `event` (default): [`Event`] and [`EventListener`], which need no runtime.
-* `tracing` (default): the runtime logs through [`tracing`]; a build without it emits no log
-  events.
-* `helper`: the layer [described above](#the-helper-feature); it implies `runtime`.
-* `broadcast`: the [`broadcast`] module, an async multi-producer multi-consumer broadcast channel
-  built on [`Event`]; it implies `event`, and needs no runtime either.
-* `mpmc`: the [`mpmc`] module, an async multi-producer multi-consumer channel, each of whose
-  messages one receiver gets, built on [`Event`]; it implies `event`, and needs no runtime
-  either.
-* `lock`: the [`lock`] module, an async `Mutex`, `RwLock` and `Semaphore`, whose guards a task may
-  hold across an await, a `Barrier` that tasks wait at for each other, and a `OnceCell` that is set
-  once, by an initialiser that may await, built on [`Event`]; it implies `event`, and needs no
-  runtime either.
-* `unblock`: [`unblock`], which runs a piece of blocking work on a pool of threads kept for it
-  and hands back a future of its outcome, and [`Unblock`], an adapter that gives a blocking I/O
-  handle, such as a file or the standard input, the async I/O traits of `futures-io` that way; it
-  needs no runtime either, and brings the `futures-io` and `futures-core` crates.
-* `fs`: the [`fs`] module, async access to the filesystem in the shape of `std::fs` and of smol's
-  `smol::fs`, with each operation run as blocking work on [`unblock`]'s pool; it implies `unblock`
-  and `lock`, and needs no runtime either.
-* `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
-  and brings the `socket2` crate.
-* `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
-* `unix`: the [`net`] module's `unix` module, with unix-domain sockets, on unix only; it implies
-  `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
-* `process`: the [`process`] module, async child processes in the shape of `std::process` and of
-  smol's `smol::process`, whose pipes the runtime watches on unix and which run as blocking work
-  on [`unblock`]'s pool on Windows; it implies `runtime` and `unblock`, and brings `rustix`'s
-  `process` feature, and, on Windows, the `Win32_Foundation` and `Win32_System_Threading`
-  features of `windows-sys`.
+* `runtime` (default): [`Runtime`], [`LocalRuntime`], [`SharedRuntime`], tasks, timers,
+  [`AsyncIo`] and [`Registration`].
+* `event` (default): [`Event`] and [`EventListener`].
+* `tracing` (default): log through [`tracing`]. Without it, the runtime logs nothing.
+* `helper`: [per-thread runtimes](#per-thread-runtimes). Implies `runtime`.
+* `lock`: the [`lock`] module. Implies `event`.
+* `mpmc`: the [`mpmc`] module. Implies `event`.
+* `broadcast`: the [`broadcast`] module. Implies `event`.
+* `unblock`: [`unblock`] and [`Unblock`].
+* `fs`: the [`fs`] module. Implies `unblock` and `lock`.
+* `tcp`: `TcpListener` and `TcpStream` in the [`net`] module. Implies `runtime`.
+* `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
+* `unix`: the `net::unix` module, on unix only. Implies `runtime`.
+* `process`: the [`process`] module. Implies `runtime` and `unblock`.
 
-`runtime` and `event` each build without the other. A crate that wants only the `Event` builds
-zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
-nor the `rustix` and `windows-sys` crates the runtime polls with; one that wants only the runtime
-leaves `event` out.
+`runtime` and `event` do not depend on each other. A crate that only needs `Event`, or the locks
+and channels built on it, can turn off the default features and enable only what it uses, such as
+`features = ["lock"]`. That builds none of the runtime, nor the OS crates it polls with.
 
 ## Why?
 
@@ -352,8 +357,6 @@ default. It was split into a separate project so non-zbus users can use it too.
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.current
 [`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
 [`Runtime::spawn`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.spawn
-[`LocalRuntime::block_on`]:
-    https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.block_on
 [`spawn`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn.html
 [`spawn_local`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn_local.html
 [`Task`]: https://docs.rs/zruntime/latest/zruntime/struct.Task.html
@@ -364,7 +367,6 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Runtime::sleep`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep
 [`Runtime::sleep_until`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep_until
-[`Sleep`]: https://docs.rs/zruntime/latest/zruntime/struct.Sleep.html
 [`Sleep::reset`]: https://docs.rs/zruntime/latest/zruntime/struct.Sleep.html#method.reset
 [`Runtime::timeout`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.timeout
 [`Runtime::interval`]:
