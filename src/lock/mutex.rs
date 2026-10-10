@@ -1,9 +1,8 @@
 //! A mutual-exclusion lock that a future can hold across an await point.
 //!
-//! [`Mutex`] keeps a value that one task at a time may use, and hands it out through a
-//! [`MutexGuard`], or through a [`MutexGuardArc`] that holds an `Arc` of the mutex rather than a
-//! borrow of it. What the locks of this crate do and do not promise is said once, in the
-//! [module documentation](super).
+//! [`Mutex`] holds a value that one task at a time can use. It gives out a [`MutexGuard`], or a
+//! [`MutexGuardArc`] that holds an `Arc` of the mutex instead of borrowing it. The
+//! [module documentation](super) describes what all the locks of this crate promise.
 
 use std::{
     cell::UnsafeCell,
@@ -20,17 +19,14 @@ use crate::Event;
 
 /// A mutual-exclusion lock whose `lock` future waits without blocking the thread.
 ///
-/// A mutex keeps a value that one task at a time may use, through the [`MutexGuard`] that
-/// [`lock`](Mutex::lock) and [`try_lock`](Mutex::try_lock) hand out and that releases the mutex
-/// when it is dropped.
+/// A mutex holds a value that one task at a time can use. [`lock`](Mutex::lock) and
+/// [`try_lock`](Mutex::try_lock) give a [`MutexGuard`], which releases the mutex when it is
+/// dropped.
 ///
-/// The mutex is built on [`Event`] and needs no runtime: it works under any executor, and may be
-/// locked from any thread. Like [`std::sync::Mutex`], it is `Send` and `Sync` wherever `T` is
-/// `Send`.
-///
-/// A panic while a guard is held does not poison the mutex, and tasks waiting for it are not served
-/// in the order they came: the [module documentation](crate::lock#no-poisoning) says what both
-/// mean.
+/// The mutex needs no runtime and works under any executor. Like [`std::sync::Mutex`], it is `Send`
+/// and `Sync` when `T` is `Send`. A panic while a guard is held does not poison it (see
+/// [no poisoning](crate::lock#no-poisoning)), and waiting tasks are not served in arrival order
+/// (see [fairness](crate::lock#fairness)).
 ///
 /// # Example
 ///
@@ -83,7 +79,7 @@ where
 unsafe impl<T> Sync for Mutex<T> where T: ?Sized + Send {}
 
 impl<T> Mutex<T> {
-    /// A new mutex holding `value`, unlocked.
+    /// Creates a mutex that holds `value` and is unlocked.
     ///
     /// This is a `const fn`, so a mutex can be a `static`.
     ///
@@ -107,9 +103,7 @@ impl<T> Mutex<T> {
         }
     }
 
-    /// Consumes the mutex, handing back its value.
-    ///
-    /// The mutex is moved, so no guard can be left to keep the value from going.
+    /// Consumes the mutex and returns its value.
     ///
     /// # Example
     ///
@@ -131,18 +125,19 @@ where
 {
     /// Acquires the lock, waiting for the current holder to release it.
     ///
-    /// The guard that comes out releases the lock when it is dropped.
+    /// The returned guard releases the lock when it is dropped. A free lock is taken at once, even
+    /// if other tasks are waiting for it, unless a waiting task is holding newcomers back. See
+    /// [fairness](crate::lock#fairness).
     ///
-    /// A lock that is free is taken at once, whichever tasks are waiting for it already, unless
-    /// one of them has waited for a while: see [fairness](crate::lock#fairness).
+    /// # Cancel safety
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
-    /// other task waiting for it is left stranded.
+    /// other task is left stranded.
     ///
     /// # Example
     ///
-    /// A second thread that waits for a lock this thread holds, and sees what this thread did to
-    /// the value once it lets go:
+    /// A second thread waits for the lock while this thread holds it. It sees the new value once
+    /// this thread releases the lock:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -168,9 +163,9 @@ where
 
     /// Acquires the lock if nobody holds it, without waiting.
     ///
-    /// Returns `None` while the mutex is held, and while a task that has waited for it for a while
-    /// holds newcomers back. Other tasks waiting for it do not count: a lock that is free is taken
-    /// ahead of them, as [`lock`](Mutex::lock) takes it. See [fairness](crate::lock#fairness).
+    /// Returns `None` if the mutex is held, or if a waiting task is holding newcomers back. Other
+    /// waiting tasks do not count: a free lock is taken ahead of them. See
+    /// [fairness](crate::lock#fairness).
     ///
     /// # Example
     ///
@@ -189,20 +184,18 @@ where
         self.try_acquire().then(|| MutexGuard(self))
     }
 
-    /// Acquires the lock, waiting for the current holder to release it, and hands out a guard
-    /// that holds an `Arc` of the mutex rather than a borrow of it.
+    /// Acquires the lock like [`lock`](Mutex::lock), but returns a guard that holds an `Arc` of the
+    /// mutex instead of borrowing it.
     ///
-    /// This waits, and treats the other tasks waiting for the mutex, exactly as
-    /// [`lock`](Mutex::lock) does; only the guard differs. A [`MutexGuardArc`] keeps the mutex
-    /// alive for as long as it lives, so it can be kept in a struct, or moved into a spawned task,
-    /// with nothing to borrow the mutex from.
+    /// Waiting and fairness are the same as for `lock`. Only the guard differs.
     ///
-    /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
-    /// other task waiting for it is left stranded.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait, as for `lock`.
     ///
     /// # Example
     ///
-    /// A guard moved onto a thread of its own, which takes only what borrows nothing:
+    /// The guard borrows nothing, so it can move to another thread:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -223,11 +216,10 @@ where
         self.acquire(|| MutexGuardArc(self.clone())).await
     }
 
-    /// Acquires the lock if nobody holds it, without waiting, and hands out a guard that holds an
-    /// `Arc` of the mutex rather than a borrow of it.
+    /// Acquires the lock if nobody holds it, without waiting, and returns a guard that holds an
+    /// `Arc` of the mutex instead of borrowing it.
     ///
-    /// Returns `None` exactly where [`try_lock`](Mutex::try_lock) does; only the guard differs, as
-    /// [`lock_arc`](Mutex::lock_arc) says.
+    /// Returns `None` in the same cases as [`try_lock`](Mutex::try_lock).
     ///
     /// # Example
     ///
@@ -248,10 +240,9 @@ where
         self.try_acquire().then(|| MutexGuardArc(self.clone()))
     }
 
-    /// The value, borrowed mutably.
+    /// A mutable reference to the value, reached without locking.
     ///
-    /// No guard can exist while the mutex is borrowed mutably, so this reaches the value without
-    /// taking the lock.
+    /// The mutable borrow of the mutex guarantees that no guard exists.
     ///
     /// # Example
     ///
@@ -350,14 +341,14 @@ impl<T> Default for Mutex<T>
 where
     T: Default,
 {
-    /// A new mutex holding the default value of `T`, unlocked.
+    /// Creates a mutex that holds `T::default()` and is unlocked.
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
 impl<T> From<T> for Mutex<T> {
-    /// A new mutex holding `value`, unlocked.
+    /// Creates a mutex that holds `value` and is unlocked.
     fn from(value: T) -> Self {
         Self::new(value)
     }
@@ -380,14 +371,14 @@ where
     }
 }
 
-/// The guard of a [`Mutex`] that is held, through which its value is used.
+/// The guard of a held [`Mutex`], through which the value is used.
 ///
-/// Made by [`Mutex::lock`] and [`Mutex::try_lock`]. The guard dereferences to the value, mutably
-/// too, and dropping it releases the mutex and wakes a task waiting for it, if there is one. A
-/// guard that has to outlive a borrow of the mutex is a [`MutexGuardArc`].
+/// Created by [`Mutex::lock`] and [`Mutex::try_lock`]. The guard dereferences to the value, also
+/// mutably. Dropping it releases the mutex and wakes a waiting task, if there is one. To keep a
+/// guard beyond the borrow of the mutex, use a [`MutexGuardArc`].
 ///
-/// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, so holding one
-/// across an await does not keep a future from moving between threads.
+/// The guard is `Send` when `T` is `Send`, and `Sync` when `T` is `Sync`, so it can be held across
+/// an await in a future that moves between threads.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct MutexGuard<'a, T>(&'a Mutex<T>)
 where
@@ -439,21 +430,17 @@ where
     }
 }
 
-/// The guard of a [`Mutex`] that is held, which holds an `Arc` of the mutex rather than a borrow of
-/// it.
+/// The guard of a held [`Mutex`] that holds an `Arc` of the mutex instead of borrowing it.
 ///
-/// Made by [`Mutex::lock_arc`] and [`Mutex::try_lock_arc`]. It does what a [`MutexGuard`] does: it
-/// dereferences to the value, mutably too, and dropping it releases the mutex and wakes a task
-/// waiting for it, if there is one. Unlike a `MutexGuard`, it is not tied to a borrow of the mutex:
-/// the `Arc` it holds keeps the mutex alive for as long as the guard lives, so the guard can be
-/// kept in a struct, or moved into a spawned task or onto another thread.
+/// Created by [`Mutex::lock_arc`] and [`Mutex::try_lock_arc`]. It works like a [`MutexGuard`], but
+/// it borrows nothing: it can be stored in a struct or moved into a spawned task or onto another
+/// thread. Its `Arc` keeps the mutex alive.
 ///
-/// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, as a `MutexGuard`
-/// is.
+/// The guard is `Send` when `T` is `Send`, and `Sync` when `T` is `Sync`, like a `MutexGuard`.
 ///
 /// # Example
 ///
-/// A guard kept in a struct, which holds the value for as long as the struct lives:
+/// A guard stored in a struct holds the value for as long as the struct lives:
 ///
 /// ```
 /// use std::sync::Arc;

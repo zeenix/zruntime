@@ -1,9 +1,8 @@
-//! A semaphore: a lock that up to a set number of tasks may hold at once.
+//! A semaphore: a lock that up to a set number of tasks can hold at once.
 //!
-//! [`Semaphore`] keeps a count of permits, and hands each one out through a [`SemaphoreGuard`], or
-//! through a [`SemaphoreGuardArc`] that holds an `Arc` of the semaphore rather than a borrow of it.
-//! What the locks of this crate do and do not promise is said once, in the
-//! [module documentation](super).
+//! [`Semaphore`] keeps a count of permits. It gives out each permit through a [`SemaphoreGuard`],
+//! or through a [`SemaphoreGuardArc`] that holds an `Arc` of the semaphore instead of borrowing it.
+//! The [module documentation](super) describes what all the locks of this crate promise.
 
 use std::{
     fmt, mem,
@@ -16,22 +15,18 @@ use std::{
 use super::WaitStart;
 use crate::Event;
 
-/// A count of permits that tasks take and give back, whose `acquire` future waits without blocking
-/// the thread.
+/// An async semaphore: a count of permits that tasks take and give back.
 ///
-/// A semaphore caps how many tasks do something at once: hold a connection, have a request in
-/// flight, keep a file open. It starts with a number of permits, and
-/// [`acquire`](Semaphore::acquire) and [`try_acquire`](Semaphore::try_acquire) each take one and
-/// hand it out as a [`SemaphoreGuard`], which gives it back when it is dropped; `acquire` waits
-/// while none is free. [`add_permits`](Semaphore::add_permits) adds permits as the program goes,
-/// and [`SemaphoreGuard::forget`] keeps one out for good.
+/// A semaphore limits how many tasks do something at once, such as hold a connection or have a
+/// request in flight. [`acquire`](Semaphore::acquire) and [`try_acquire`](Semaphore::try_acquire)
+/// take a permit and give it out as a [`SemaphoreGuard`], which returns the permit when it is
+/// dropped. `acquire` waits, without blocking the thread, while no permit is free.
+/// [`add_permits`](Semaphore::add_permits) adds permits, and [`SemaphoreGuard::forget`] removes one
+/// for good.
 ///
-/// The semaphore is built on [`Event`] and needs no runtime: it works under any executor, and
-/// permits may be taken from any thread. It keeps no value, so it is `Send` and `Sync`, and so are
-/// its guards.
-///
-/// Tasks waiting for a permit are not served in the order they came: the
-/// [module documentation](crate::lock#fairness) says what that means.
+/// The semaphore needs no runtime and works under any executor. It holds no value, so it is `Send`
+/// and `Sync`, and so are its guards. Waiting tasks are not served in arrival order: see
+/// [fairness](crate::lock#fairness).
 ///
 /// # Example
 ///
@@ -104,16 +99,16 @@ pub struct Semaphore {
 }
 
 impl Semaphore {
-    /// The most permits a semaphore can have free where [`new`](Semaphore::new) and
-    /// [`add_permits`](Semaphore::add_permits) set the count: half of what a `usize` counts.
+    /// The largest number of free permits that [`new`](Semaphore::new) and
+    /// [`add_permits`](Semaphore::add_permits) allow. It is `usize::MAX / 2`.
     ///
-    /// A guard gives its permit back as it is dropped, which can report no error, so the count of
-    /// free permits must have room for every permit that can come back: the other half is left
-    /// for those. The count can go past this as guards give back permits that were out when it was
-    /// set, and `add_permits` then panics if it is asked to add even one.
+    /// The other half of the range is kept for permits that come back, because a guard cannot
+    /// report an error when it returns its permit. The number of free permits can still go past
+    /// this value when permits that were out come back. After that, `add_permits` panics even for
+    /// one permit.
     pub const MAX_PERMITS: usize = usize::MAX >> 1;
 
-    /// A new semaphore with `permits` free.
+    /// Creates a semaphore with `permits` free permits.
     ///
     /// This is a `const fn`, so a semaphore can be a `static`.
     ///
@@ -146,18 +141,19 @@ impl Semaphore {
 
     /// Takes a permit, waiting while none is free.
     ///
-    /// The guard that comes out gives the permit back when it is dropped.
+    /// The returned guard gives the permit back when it is dropped. A free permit is taken at once,
+    /// even if other tasks are waiting for one, unless a waiting task is holding newcomers back.
+    /// See [fairness](crate::lock#fairness).
     ///
-    /// A permit that is free is taken at once, whichever tasks are waiting for one already, unless
-    /// one of them has waited for a while: see [fairness](crate::lock#fairness).
+    /// # Cancel safety
     ///
     /// Dropping the future before it completes gives up the wait. No permit is taken, and no other
-    /// task waiting for one is left stranded.
+    /// task is left stranded.
     ///
     /// # Example
     ///
-    /// A second thread that waits for the only permit, which this thread holds, and gets it once
-    /// this thread lets go:
+    /// A second thread waits for the only permit while this thread holds it. It gets the permit
+    /// once this thread drops its guard:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -182,9 +178,8 @@ impl Semaphore {
 
     /// Takes a permit if one is free, without waiting.
     ///
-    /// Returns `None` while no permit is free, and while a task that has waited for one for a while
-    /// holds newcomers back. Other tasks waiting for a permit do not count: a free permit is taken
-    /// ahead of them, as [`acquire`](Semaphore::acquire) takes it. See
+    /// Returns `None` if no permit is free, or if a waiting task is holding newcomers back. Other
+    /// waiting tasks do not count: a free permit is taken ahead of them. See
     /// [fairness](crate::lock#fairness).
     ///
     /// # Example
@@ -205,21 +200,19 @@ impl Semaphore {
         self.try_take_as(false).then(|| SemaphoreGuard(self))
     }
 
-    /// Takes a permit, waiting while none is free, and hands out a guard that holds an `Arc` of
-    /// the semaphore rather than a borrow of it.
+    /// Takes a permit like [`acquire`](Semaphore::acquire), but returns a guard that holds an `Arc`
+    /// of the semaphore instead of borrowing it.
     ///
-    /// This waits, and treats the other tasks waiting for a permit, exactly as
-    /// [`acquire`](Semaphore::acquire) does; only the guard differs. A [`SemaphoreGuardArc`] keeps
-    /// the semaphore alive for as long as it lives, so it can be kept in a struct, or moved into a
-    /// spawned task, with nothing to borrow the semaphore from.
+    /// Waiting and fairness are the same as for `acquire`. Only the guard differs.
     ///
-    /// Dropping the future before it completes gives up the wait. No permit is taken, and no other
-    /// task waiting for one is left stranded.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait, as for `acquire`.
     ///
     /// # Example
     ///
-    /// A permit moved onto a thread of its own, which takes only what borrows nothing, and given
-    /// back there:
+    /// The guard borrows nothing, so it can move to another thread, which returns the permit when
+    /// it drops the guard:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -240,11 +233,10 @@ impl Semaphore {
         self.take(|| SemaphoreGuardArc(Some(self.clone()))).await
     }
 
-    /// Takes a permit if one is free, without waiting, and hands out a guard that holds an `Arc` of
-    /// the semaphore rather than a borrow of it.
+    /// Takes a permit if one is free, without waiting, and returns a guard that holds an `Arc` of
+    /// the semaphore instead of borrowing it.
     ///
-    /// Returns `None` exactly where [`try_acquire`](Semaphore::try_acquire) does; only the guard
-    /// differs, as [`acquire_arc`](Semaphore::acquire_arc) says.
+    /// Returns `None` in the same cases as [`try_acquire`](Semaphore::try_acquire).
     ///
     /// # Example
     ///
@@ -269,13 +261,14 @@ impl Semaphore {
             .then(|| SemaphoreGuardArc(Some(self.clone())))
     }
 
-    /// Adds `n` free permits, and wakes as many more tasks waiting for one.
+    /// Adds `n` free permits and wakes up to `n` waiting tasks.
     ///
-    /// Adding none does nothing.
+    /// Adding zero permits does nothing.
     ///
     /// # Panics
     ///
-    /// Panics if that would leave more than [`MAX_PERMITS`](Semaphore::MAX_PERMITS) permits free.
+    /// Panics if the addition would leave more than [`MAX_PERMITS`](Semaphore::MAX_PERMITS) permits
+    /// free.
     ///
     /// # Example
     ///
@@ -416,21 +409,21 @@ impl fmt::Debug for Semaphore {
     }
 }
 
-/// A permit taken from a [`Semaphore`], given back when the guard is dropped.
+/// A permit taken from a [`Semaphore`]. The guard returns the permit when it is dropped.
 ///
-/// Made by [`Semaphore::acquire`] and [`Semaphore::try_acquire`]. Dropping the guard gives the
-/// permit back and wakes a task waiting for one, if there is one;
-/// [`forget`](SemaphoreGuard::forget) keeps the permit out for good instead. A guard that has to
-/// outlive a borrow of the semaphore is a [`SemaphoreGuardArc`].
+/// Created by [`Semaphore::acquire`] and [`Semaphore::try_acquire`]. Dropping the guard gives the
+/// permit back and wakes a waiting task, if there is one. [`forget`](SemaphoreGuard::forget) keeps
+/// the permit out for good instead. To keep a guard beyond the borrow of the semaphore, use a
+/// [`SemaphoreGuardArc`].
 ///
-/// A guard is `Send` and `Sync`, by the auto traits alone: it stands for a permit and reaches no
-/// value.
+/// The guard is `Send` and `Sync`, because it stands for a permit and gives access to no value.
 #[must_use = "if unused the Semaphore will immediately give the permit back"]
 pub struct SemaphoreGuard<'a>(&'a Semaphore);
 
 impl SemaphoreGuard<'_> {
-    /// Drops the guard without giving its permit back, which leaves the semaphore with one permit
-    /// fewer for good.
+    /// Consumes the guard without returning its permit.
+    ///
+    /// The semaphore has one permit fewer for good.
     ///
     /// # Example
     ///
@@ -465,22 +458,19 @@ impl Drop for SemaphoreGuard<'_> {
     }
 }
 
-/// A permit taken from a [`Semaphore`], given back when the guard is dropped, which holds an `Arc`
-/// of the semaphore rather than a borrow of it.
+/// A permit taken from a [`Semaphore`], held through an `Arc` of the semaphore instead of a borrow.
+/// The guard returns the permit when it is dropped.
 ///
-/// Made by [`Semaphore::acquire_arc`] and [`Semaphore::try_acquire_arc`]. It does what a
-/// [`SemaphoreGuard`] does: dropping it gives the permit back and wakes a task waiting for one, if
-/// there is one, and [`forget`](SemaphoreGuardArc::forget) keeps the permit out for good instead.
-/// Unlike a `SemaphoreGuard`, it is not tied to a borrow of the semaphore: the `Arc` it holds
-/// keeps the semaphore alive for as long as the guard lives, so the guard can be kept in a struct,
-/// or moved into a spawned task or onto another thread.
+/// Created by [`Semaphore::acquire_arc`] and [`Semaphore::try_acquire_arc`]. It works like a
+/// [`SemaphoreGuard`], but it borrows nothing: it can be stored in a struct or moved into a spawned
+/// task or onto another thread. Its `Arc` keeps the semaphore alive.
+/// [`forget`](SemaphoreGuardArc::forget) keeps the permit out for good.
 ///
-/// A guard is `Send` and `Sync`, by the auto traits alone: it stands for a permit and reaches no
-/// value.
+/// The guard is `Send` and `Sync`, because it stands for a permit and gives access to no value.
 ///
 /// # Example
 ///
-/// A connection that holds one of a limited number of permits for as long as it is open:
+/// A connection holds a permit for as long as it is open:
 ///
 /// ```
 /// use std::sync::Arc;
@@ -509,10 +499,10 @@ pub struct SemaphoreGuardArc(
 );
 
 impl SemaphoreGuardArc {
-    /// Drops the guard without giving its permit back, which leaves the semaphore with one permit
-    /// fewer for good.
+    /// Consumes the guard without returning its permit.
     ///
-    /// The guard lets go of its `Arc` of the semaphore all the same.
+    /// The semaphore has one permit fewer for good. The guard still drops its `Arc` of the
+    /// semaphore.
     ///
     /// # Example
     ///

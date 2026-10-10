@@ -1,10 +1,9 @@
 //! A readers-writer lock that a future can hold across an await point.
 //!
-//! [`RwLock`] keeps a value that any number of readers may share or one writer may use, and hands
-//! it out through an [`RwLockReadGuard`] or an [`RwLockWriteGuard`], or through an
-//! [`RwLockReadGuardArc`] or an [`RwLockWriteGuardArc`], which hold an `Arc` of the lock rather
-//! than a borrow of it. What the locks of this crate do and do not promise is said once, in the
-//! [module documentation](super).
+//! [`RwLock`] holds a value that any number of readers can share or one writer can use. It gives
+//! out an [`RwLockReadGuard`] or an [`RwLockWriteGuard`], or an [`RwLockReadGuardArc`] or an
+//! [`RwLockWriteGuardArc`], which hold an `Arc` of the lock instead of borrowing it. The
+//! [module documentation](super) describes what all the locks of this crate promise.
 
 use std::{
     cell::UnsafeCell,
@@ -19,37 +18,34 @@ use crate::Event;
 
 /// A readers-writer lock whose `read` and `write` futures wait without blocking the thread.
 ///
-/// The lock keeps a value that is either shared by any number of readers or used by one writer.
-/// [`read`](RwLock::read) hands out an [`RwLockReadGuard`], which dereferences to the value and may
-/// be held by many tasks at once; [`write`](RwLock::write) hands out an [`RwLockWriteGuard`], which
-/// dereferences to it mutably and is held by one task alone, with no reader beside it.
+/// The lock holds a value that is either shared by any number of readers or used by one writer.
+/// [`read`](RwLock::read) gives an [`RwLockReadGuard`], which dereferences to the value and can be
+/// held by many tasks at once. [`write`](RwLock::write) gives an [`RwLockWriteGuard`], which
+/// dereferences to the value mutably and is held by one task alone.
 ///
-/// The lock is built on [`Event`] and needs no runtime: it works under any executor, and may be
-/// taken from any thread. Like [`std::sync::RwLock`], it is `Send` wherever `T` is `Send`, and
-/// `Sync` wherever `T` is `Send` and `Sync`.
-///
-/// A panic while a guard is held does not poison the lock, and tasks waiting for it are not served
-/// in the order they came: the [module documentation](crate::lock#no-poisoning) says what both
-/// mean.
+/// The lock needs no runtime and works under any executor. Like [`std::sync::RwLock`], it is `Send`
+/// when `T` is `Send`, and `Sync` when `T` is `Send` and `Sync`. A panic while a guard is held does
+/// not poison it (see [no poisoning](crate::lock#no-poisoning)), and waiting tasks are not served
+/// in arrival order (see [fairness](crate::lock#fairness)).
 ///
 /// # Write preference
 ///
-/// The lock prefers writers: while a writer waits for it, new readers wait too, so that a steady
-/// stream of readers cannot keep the writer out for good. The other side of it is that writers
-/// coming one after the other would keep readers out for as long as they kept coming, so a reader
-/// that has waited for a while is let in the next time no writer holds the lock, ahead of the
-/// writers waiting for it: see [fairness](crate::lock#fairness). Until such a reader is in, no
-/// writer takes the lock, even while it is free, so a reader whose task is slow to run keeps the
-/// writers waiting, as a waiting writer keeps new readers waiting. A writer counts as waiting from
-/// the first poll of its [`write`](RwLock::write) future until that future completes or is
-/// dropped, so a `write` that is given up, by a timeout say, stops holding readers back: they are
-/// let in again unless another writer holds or waits for the lock.
+/// The lock prefers writers: while a writer waits for the lock, new readers wait too. A steady
+/// stream of readers therefore cannot keep a writer out for good.
 ///
-/// A task that holds a read guard must therefore not ask for another one. If a writer arrives in
-/// between, the second [`read`](RwLock::read) waits for that writer, the writer waits for the first
-/// guard, and the task holds the first guard until its second `read` is done: the three wait for
-/// each other for good. [`try_read`](RwLock::try_read) never waits, so it cannot deadlock this way,
-/// but it fails instead.
+/// To keep a stream of writers from locking readers out in turn, a reader that has waited for a
+/// while is let in the next time no writer holds the lock, ahead of the waiting writers (see
+/// [fairness](crate::lock#fairness)). No writer takes the lock until that reader is in, even if the
+/// lock is free.
+///
+/// A writer counts as waiting from the first poll of its [`write`](RwLock::write) future until the
+/// future completes or is dropped. If the future is dropped, for example by a timeout, that writer
+/// stops holding readers back.
+///
+/// A task that holds a read guard must not ask for another one. If a writer arrives in between, the
+/// second [`read`](RwLock::read) waits for the writer, and the writer waits for the first guard,
+/// which the task holds until its second `read` completes. The three wait for each other forever.
+/// [`try_read`](RwLock::try_read) cannot deadlock this way, but it returns `None` in that case.
 ///
 /// # Example
 ///
@@ -87,7 +83,7 @@ where
 unsafe impl<T> Sync for RwLock<T> where T: ?Sized + Send + Sync {}
 
 impl<T> RwLock<T> {
-    /// A new lock holding `value`, held by nobody.
+    /// Creates a lock that holds `value` and is held by nobody.
     ///
     /// This is a `const fn`, so a lock can be a `static`.
     ///
@@ -117,9 +113,7 @@ impl<T> RwLock<T> {
         }
     }
 
-    /// Consumes the lock, handing back its value.
-    ///
-    /// The lock is moved, so no guard can be left to keep the value from going.
+    /// Consumes the lock and returns its value.
     ///
     /// # Example
     ///
@@ -141,15 +135,17 @@ where
 {
     /// Acquires shared access, waiting while a writer holds or waits for the lock.
     ///
-    /// Any number of readers may hold the lock at once. The guard that comes out gives up its share
-    /// when it is dropped.
+    /// Any number of readers can hold the lock at once. The returned guard gives up its share when
+    /// it is dropped.
     ///
     /// A task that holds a read guard must not call this again: see
     /// [write preference](RwLock#write-preference). A reader that has waited for a while is let in
-    /// ahead of the writers waiting for the lock: see [fairness](crate::lock#fairness).
+    /// ahead of the waiting writers: see [fairness](crate::lock#fairness).
+    ///
+    /// # Cancel safety
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
-    /// other task waiting for it is left stranded.
+    /// other task is left stranded.
     ///
     /// # Example
     ///
@@ -171,20 +167,22 @@ where
 
     /// Acquires exclusive access, waiting for every reader and writer to leave.
     ///
-    /// While this future waits, it holds new readers back, so that a steady stream of readers
-    /// cannot keep it out for good: see [write preference](RwLock#write-preference). The guard
-    /// that comes out releases the lock when it is dropped.
+    /// While the future waits, it holds new readers back, so that a steady stream of readers cannot
+    /// keep it out for good. See [write preference](RwLock#write-preference). The returned guard
+    /// releases the lock when it is dropped.
     ///
-    /// A lock that is free is taken at once, whichever writers are waiting for it already, unless
-    /// a task waiting for it has waited for a while: see [fairness](crate::lock#fairness).
+    /// A free lock is taken at once, even if other writers are waiting for it, unless a waiting
+    /// task is holding newcomers back. See [fairness](crate::lock#fairness).
+    ///
+    /// # Cancel safety
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, the future
-    /// stops holding readers back, and no other task waiting for the lock is left stranded.
+    /// stops holding readers back, and no other task is left stranded.
     ///
     /// # Example
     ///
-    /// A second thread that waits for a lock this thread holds, and sees what this thread did to
-    /// the value once it lets go:
+    /// A second thread waits for the lock while this thread holds it. It sees the new value once
+    /// this thread releases the lock:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -210,11 +208,13 @@ where
 
     /// Acquires shared access if no writer holds or waits for the lock, without waiting.
     ///
-    /// Returns `None` while a writer holds the lock, and while one waits for it too: a waiting
-    /// writer holds new readers back, as [write preference](RwLock#write-preference) says. Other
-    /// readers holding the lock do not stop this, for any number share it. A writer counts as
-    /// waiting from the first poll of its `write` future, even one that then takes a free lock at
-    /// once, so this can fail on a lock nobody holds while a `write` is polled on another thread.
+    /// Returns `None` if a writer holds the lock or waits for it. Other readers do not stop this
+    /// call, because any number of readers can share the lock. See
+    /// [write preference](RwLock#write-preference).
+    ///
+    /// A writer counts as waiting from the first poll of its `write` future, even if it then takes
+    /// a free lock at once. So this method can fail on a free lock while another thread polls a
+    /// `write`.
     ///
     /// # Example
     ///
@@ -236,10 +236,9 @@ where
 
     /// Acquires exclusive access if nobody holds the lock, without waiting.
     ///
-    /// Returns `None` while a reader or a writer holds the lock, and while a task that has waited
-    /// for it for a while holds newcomers back. Other writers waiting for it do not count: a lock
-    /// that is free is taken ahead of them, as [`write`](RwLock::write) takes it (see
-    /// [fairness](crate::lock#fairness)), and one of them is woken once this guard is dropped.
+    /// Returns `None` if a reader or a writer holds the lock, or if a waiting task is holding
+    /// newcomers back. Other waiting writers do not count: a free lock is taken ahead of them, and
+    /// one of them is woken when this guard is dropped. See [fairness](crate::lock#fairness).
     ///
     /// # Example
     ///
@@ -260,19 +259,16 @@ where
         self.try_acquire_write().then(|| RwLockWriteGuard(self))
     }
 
-    /// Acquires shared access, waiting while a writer holds or waits for the lock, and hands out a
-    /// guard that holds an `Arc` of the lock rather than a borrow of it.
+    /// Acquires shared access like [`read`](RwLock::read), but returns a guard that holds an `Arc`
+    /// of the lock instead of borrowing it.
     ///
-    /// This waits, and treats the other tasks waiting for the lock, exactly as
-    /// [`read`](RwLock::read) does, write preference included; only the guard differs. An
-    /// [`RwLockReadGuardArc`] keeps the lock alive for as long as it lives, so it can be kept in a
-    /// struct, or moved into a spawned task, with nothing to borrow the lock from.
-    ///
-    /// A task that holds a read guard of either kind must not call this, nor `read`, again: see
+    /// Waiting, write preference and fairness are the same as for `read`. Only the guard differs. A
+    /// task that holds a read guard of either kind must not call this, or `read`, again: see
     /// [write preference](RwLock#write-preference).
     ///
-    /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
-    /// other task waiting for it is left stranded.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait, as for `read`.
     ///
     /// # Example
     ///
@@ -295,11 +291,10 @@ where
         self.acquire_read(|| RwLockReadGuardArc(self.clone())).await
     }
 
-    /// Acquires shared access if no writer holds or waits for the lock, without waiting, and hands
-    /// out a guard that holds an `Arc` of the lock rather than a borrow of it.
+    /// Acquires shared access if no writer holds or waits for the lock, without waiting, and
+    /// returns a guard that holds an `Arc` of the lock instead of borrowing it.
     ///
-    /// Returns `None` exactly where [`try_read`](RwLock::try_read) does; only the guard differs, as
-    /// [`read_arc`](RwLock::read_arc) says.
+    /// Returns `None` in the same cases as [`try_read`](RwLock::try_read).
     ///
     /// # Example
     ///
@@ -320,16 +315,14 @@ where
             .then(|| RwLockReadGuardArc(self.clone()))
     }
 
-    /// Acquires exclusive access, waiting for every reader and writer to leave, and hands out a
-    /// guard that holds an `Arc` of the lock rather than a borrow of it.
+    /// Acquires exclusive access like [`write`](RwLock::write), but returns a guard that holds an
+    /// `Arc` of the lock instead of borrowing it.
     ///
-    /// This waits, holds new readers back while it does, and treats the other tasks waiting for
-    /// the lock, exactly as [`write`](RwLock::write) does; only the guard differs. An
-    /// [`RwLockWriteGuardArc`] keeps the lock alive for as long as it lives, so it can be kept in
-    /// a struct, or moved into a spawned task, with nothing to borrow the lock from.
+    /// Waiting, write preference and fairness are the same as for `write`. Only the guard differs.
     ///
-    /// Dropping the future before it completes gives up the wait. The lock is not taken, the future
-    /// stops holding readers back, and no other task waiting for the lock is left stranded.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait, as for `write`.
     ///
     /// # Example
     ///
@@ -353,11 +346,10 @@ where
             .await
     }
 
-    /// Acquires exclusive access if nobody holds the lock, without waiting, and hands out a guard
-    /// that holds an `Arc` of the lock rather than a borrow of it.
+    /// Acquires exclusive access if nobody holds the lock, without waiting, and returns a guard
+    /// that holds an `Arc` of the lock instead of borrowing it.
     ///
-    /// Returns `None` exactly where [`try_write`](RwLock::try_write) does; only the guard differs,
-    /// as [`write_arc`](RwLock::write_arc) says.
+    /// Returns `None` in the same cases as [`try_write`](RwLock::try_write).
     ///
     /// # Example
     ///
@@ -380,10 +372,9 @@ where
             .then(|| RwLockWriteGuardArc(self.clone()))
     }
 
-    /// The value, borrowed mutably.
+    /// A mutable reference to the value, reached without locking.
     ///
-    /// No guard can exist while the lock is borrowed mutably, so this reaches the value without
-    /// taking the lock.
+    /// The mutable borrow of the lock guarantees that no guard exists.
     ///
     /// # Example
     ///
@@ -530,14 +521,14 @@ impl<T> Default for RwLock<T>
 where
     T: Default,
 {
-    /// A new lock holding the default value of `T`, held by nobody.
+    /// Creates a lock that holds `T::default()` and is held by nobody.
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
 impl<T> From<T> for RwLock<T> {
-    /// A new lock holding `value`, held by nobody.
+    /// Creates a lock that holds `value` and is held by nobody.
     fn from(value: T) -> Self {
         Self::new(value)
     }
@@ -562,13 +553,12 @@ where
 
 /// Shared access to the value of an [`RwLock`], for as long as the guard lives.
 ///
-/// Made by [`RwLock::read`] and [`RwLock::try_read`]. The guard dereferences to the value, and
-/// dropping it gives up its share of the lock: once the last reader is gone, a writer waiting for
-/// the lock is woken. A guard that has to outlive a borrow of the lock is an
-/// [`RwLockReadGuardArc`].
+/// Created by [`RwLock::read`] and [`RwLock::try_read`]. The guard dereferences to the value.
+/// Dropping it gives up its share of the lock, and when the last reader is gone, a waiting writer
+/// is woken. To keep a guard beyond the borrow of the lock, use an [`RwLockReadGuardArc`].
 ///
-/// A guard is `Send` and `Sync` wherever `T` is `Sync`, so holding one across an await does not
-/// keep a future from moving between threads.
+/// The guard is `Send` and `Sync` when `T` is `Sync`, so it can be held across an await in a future
+/// that moves between threads.
 #[must_use = "if unused the RwLock will immediately unlock"]
 pub struct RwLockReadGuard<'a, T>(&'a RwLock<T>)
 where
@@ -614,13 +604,12 @@ where
 
 /// Exclusive access to the value of an [`RwLock`], for as long as the guard lives.
 ///
-/// Made by [`RwLock::write`] and [`RwLock::try_write`]. The guard dereferences to the value,
-/// mutably too, and dropping it releases the lock and wakes the readers and the writer waiting
-/// for it, if there are any. A guard that has to outlive a borrow of the lock is an
-/// [`RwLockWriteGuardArc`].
+/// Created by [`RwLock::write`] and [`RwLock::try_write`]. The guard dereferences to the value,
+/// also mutably. Dropping it releases the lock and wakes the waiting readers and writer, if there
+/// are any. To keep a guard beyond the borrow of the lock, use an [`RwLockWriteGuardArc`].
 ///
-/// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, so holding one
-/// across an await does not keep a future from moving between threads.
+/// The guard is `Send` when `T` is `Send`, and `Sync` when `T` is `Sync`, so it can be held across
+/// an await in a future that moves between threads.
 #[must_use = "if unused the RwLock will immediately unlock"]
 pub struct RwLockWriteGuard<'a, T>(&'a RwLock<T>)
 where
@@ -675,22 +664,17 @@ where
     }
 }
 
-/// Shared access to the value of an [`RwLock`], for as long as the guard lives, through an `Arc` of
-/// the lock rather than a borrow of it.
+/// Shared access to the value of an [`RwLock`] through an `Arc` of the lock, for as long as the
+/// guard lives.
 ///
-/// Made by [`RwLock::read_arc`] and [`RwLock::try_read_arc`]. It does what an [`RwLockReadGuard`]
-/// does: it dereferences to the value, and dropping it gives up its share of the lock, waking a
-/// writer waiting for the lock once the last reader is gone. Unlike an `RwLockReadGuard`, it is not
-/// tied to a borrow of the lock: the `Arc` it holds keeps the lock alive for as long as the guard
-/// lives, so the guard can be kept in a struct, or moved into a spawned task or onto another
-/// thread.
+/// Created by [`RwLock::read_arc`] and [`RwLock::try_read_arc`]. It works like an
+/// [`RwLockReadGuard`], but it borrows nothing: it can be stored in a struct or moved into a
+/// spawned task or onto another thread. Its `Arc` keeps the lock alive.
 ///
-/// A guard is `Send` wherever `T` is `Send` and `Sync`, which is what it takes for an `Arc` of the
-/// lock to go to another thread: the guard holds one, and dropping it there can drop the last
-/// `Arc`, and the value with it. It is `Sync` wherever `T` is `Send` and `Sync` too, through the
-/// `Arc`, which is more than sharing a guard needs, for that shares a `&T` and nothing else. A
-/// guard of a value that is `Sync` but not `Send` therefore cannot be shared by reference with
-/// another thread, a scoped one say, as an `RwLockReadGuard` or a `MutexGuardArc` of it can.
+/// The guard is `Send` and `Sync` when `T` is `Send` and `Sync`, because it holds an `Arc` of the
+/// lock. An [`RwLockReadGuard`] needs less: it is `Send` and `Sync` when `T` is `Sync`. For
+/// example, a scoped thread can share an `RwLockReadGuard` or a `MutexGuardArc` of a value that is
+/// `Sync` but not `Send` by reference, but not this guard.
 ///
 /// # Example
 ///
@@ -758,23 +742,18 @@ where
     }
 }
 
-/// Exclusive access to the value of an [`RwLock`], for as long as the guard lives, through an `Arc`
-/// of the lock rather than a borrow of it.
+/// Exclusive access to the value of an [`RwLock`] through an `Arc` of the lock, for as long as the
+/// guard lives.
 ///
-/// Made by [`RwLock::write_arc`] and [`RwLock::try_write_arc`]. It does what an
-/// [`RwLockWriteGuard`] does: it dereferences to the value, mutably too, and dropping it releases
-/// the lock and wakes the readers and the writer waiting for it, if there are any. Unlike an
-/// `RwLockWriteGuard`, it is not tied to a borrow of the lock: the `Arc` it holds keeps the lock
-/// alive for as long as the guard lives, so the guard can be kept in a struct, or moved into a
-/// spawned task or onto another thread.
+/// Created by [`RwLock::write_arc`] and [`RwLock::try_write_arc`]. It works like an
+/// [`RwLockWriteGuard`], but it borrows nothing: it can be stored in a struct or moved into a
+/// spawned task or onto another thread. Its `Arc` keeps the lock alive.
 ///
-/// A guard is `Send` wherever `T` is `Send` and `Sync`, which is what it takes for an `Arc` of the
-/// lock to go to another thread: the guard holds one, and dropping it there can drop the last
-/// `Arc`, and the value with it. It is `Sync` wherever `T` is `Send` and `Sync` too, through the
-/// `Arc`. Both are more than an `RwLockWriteGuard` asks, which is `Send` wherever `T` is `Send`
-/// and `Sync` wherever `T` is `Sync`. So a scoped thread, say, can be given a borrowing guard of a
-/// value that is `Send` but not `Sync`, or share one of a value that is `Sync` but not `Send`, and
-/// can do neither with this guard.
+/// The guard is `Send` and `Sync` when `T` is `Send` and `Sync`, because it holds an `Arc` of the
+/// lock. An [`RwLockWriteGuard`] needs less: it is `Send` when `T` is `Send` and `Sync` when `T` is
+/// `Sync`. For example, a scoped thread can be given an `RwLockWriteGuard` of a value that is
+/// `Send` but not `Sync`, or share one of a value that is `Sync` but not `Send`, but it can do
+/// neither with this guard.
 ///
 /// # Example
 ///

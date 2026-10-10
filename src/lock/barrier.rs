@@ -1,8 +1,7 @@
 //! A barrier that tasks wait at until enough of them have arrived.
 //!
-//! [`Barrier`] makes a number of tasks wait for each other, and releases them together. What the
-//! primitives of this module do and do not promise is said once, in the
-//! [module documentation](super).
+//! [`Barrier`] makes a number of tasks wait for each other and releases them together. The
+//! [module documentation](super) describes what all the primitives of this module promise.
 
 use std::{
     fmt,
@@ -13,28 +12,27 @@ use crate::Event;
 
 /// A barrier that makes tasks wait for each other, without blocking the thread.
 ///
-/// A barrier is made for `n` tasks. Each task that calls [`wait`](Barrier::wait) waits there until
-/// the `n`-th has arrived, and the `n` of them are released together. That is one round, and the
-/// barrier is ready for the next one at once, so a single barrier serves tasks that meet over and
-/// over, as the workers of a simulation do at the end of each step.
+/// A barrier is made for `n` tasks. Each task that calls [`wait`](Barrier::wait) waits until the
+/// `n`-th task arrives. Then all `n` tasks are released together. This is one round, and the
+/// barrier is ready for the next round at once, so a single barrier serves tasks that meet over and
+/// over.
 ///
-/// Exactly one of the tasks of a round is its leader: the one whose arrival completes the round,
-/// which is not held up at all. Its [`BarrierWaitResult`] says so, for the work that only one of
-/// the tasks is to do after the meeting.
+/// Each round has one leader: the task whose arrival completes the round. It is not held up, and
+/// its [`BarrierWaitResult`] says so, so that one task can do work that only one task should do
+/// after the meeting.
 ///
-/// A barrier made for no tasks behaves as one made for one, as [`std::sync::Barrier`] does: every
-/// `wait` completes at once, as the leader of a round of its own.
+/// A barrier made for zero tasks behaves like one made for one task, as with
+/// [`std::sync::Barrier`]: every `wait` completes at once, and the task is the leader of its own
+/// round.
 ///
-/// The barrier is built on [`Event`] and needs no runtime: it works under any executor, and may be
-/// waited at from any thread. It is `Send` and `Sync`, and so are the futures that wait at it.
-///
-/// A task that panics instead of arriving leaves the others waiting for it, as it does with
-/// [`std::sync::Barrier`]; nothing is poisoned, and a task that gives up its wait is no longer
-/// counted: see [giving up a wait](crate::lock#giving-up-a-wait).
+/// The barrier needs no runtime and works under any executor. It is `Send` and `Sync`, and so are
+/// the futures that wait at it. A task that panics instead of arriving leaves the others waiting
+/// for it, and nothing is poisoned. A task that gives up its wait is no longer counted: see
+/// [giving up a wait](crate::lock#giving-up-a-wait).
 ///
 /// # Example
 ///
-/// Three threads that wait for each other, one of which is told that it led the round:
+/// Three threads wait for each other. Exactly one of them is the leader:
 ///
 /// ```
 /// use std::{sync::Arc, thread};
@@ -70,11 +68,10 @@ pub struct Barrier {
 }
 
 impl Barrier {
-    /// A new barrier for `n` tasks, with none waiting.
+    /// Creates a barrier for `n` tasks, with none waiting.
     ///
-    /// A barrier for `0` tasks behaves as one for `1`.
-    ///
-    /// This is a `const fn`, so a barrier can be a `static`.
+    /// A barrier for `0` tasks behaves like one for `1`. This is a `const fn`, so a barrier can be
+    /// a `static`.
     ///
     /// # Example
     ///
@@ -99,19 +96,21 @@ impl Barrier {
 
     /// Waits for the other tasks of the round to arrive.
     ///
-    /// The task arrives when the future is first polled, not when it is made. It completes once
-    /// `n` tasks have arrived, this one included: at once for the `n`-th, which is the leader of
-    /// the round and gets a [`BarrierWaitResult`] that says so, and as that `n`-th arrives for each
-    /// of the others. The barrier is then ready for the tasks of the next round.
+    /// The task arrives when the future is first polled, not when it is created. The future
+    /// completes once `n` tasks have arrived, including this one. The `n`-th task to arrive
+    /// completes at once. It is the leader of the round, and its [`BarrierWaitResult`] says so. The
+    /// other tasks complete when the `n`-th task arrives. The barrier is then ready for the next
+    /// round.
     ///
-    /// Dropping the future after its first poll and before it completes gives up the wait: the
-    /// task is no longer counted as having arrived, unless the round has been completed by then,
-    /// so the barrier again needs `n` arrivals to release the tasks that wait at it. See
+    /// # Cancel safety
+    ///
+    /// Dropping the future after its first poll and before it completes gives up the wait. The task
+    /// is no longer counted as arrived, unless the round has completed by then. See
     /// [giving up a wait](crate::lock#giving-up-a-wait).
     ///
     /// # Example
     ///
-    /// Two waits driven together by one thread, each of which needs the other to have begun:
+    /// One thread drives two waits together. Each wait needs the other to have started:
     ///
     /// ```
     /// use futures::{executor::block_on, future::join};
@@ -175,9 +174,9 @@ impl fmt::Debug for Barrier {
     }
 }
 
-/// What a task that waited at a [`Barrier`] comes away with: whether it led its round.
+/// The result of waiting at a [`Barrier`]: whether the task led its round.
 ///
-/// Made by [`Barrier::wait`].
+/// Created by [`Barrier::wait`].
 pub struct BarrierWaitResult {
     leader: bool,
 }
@@ -185,8 +184,8 @@ pub struct BarrierWaitResult {
 impl BarrierWaitResult {
     /// Whether this task is the leader of its round.
     ///
-    /// The leader is the task whose arrival completed the round, the last to arrive. Exactly one
-    /// task of each round is.
+    /// The leader is the task whose arrival completed the round, which is the last task to arrive.
+    /// Each round has exactly one leader.
     ///
     /// # Example
     ///

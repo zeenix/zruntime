@@ -1,8 +1,8 @@
 //! A cell that is set once, to a value that tasks can wait for.
 //!
-//! [`OnceCell`] holds a value that is set once, by an initialiser that may be asynchronous, and
-//! handed out by reference from then on. What the primitives of this module do and do not promise
-//! is said once, in the [module documentation](super).
+//! [`OnceCell`] holds a value that is set once, by an initialiser that may be asynchronous. Every
+//! task then gets a reference to it. The [module documentation](super) describes what all the
+//! primitives of this module promise.
 
 use std::{
     convert::Infallible,
@@ -16,54 +16,51 @@ use std::{
 use super::{Mutex, MutexGuard};
 use crate::Event;
 
-/// A cell that is set once, by an initialiser that may be asynchronous, and that tasks can wait
-/// for the value of.
+/// A cell that is set once, by an initialiser that may await, and whose value tasks can wait for.
 ///
-/// A cell starts out empty. The first value that reaches it stays for as long as the cell lives,
-/// and every task is handed a reference to that one value. It is [`std::sync::OnceLock`] for tasks:
-/// [`get_or_init`](OnceCell::get_or_init) and [`get_or_try_init`](OnceCell::get_or_try_init) take
-/// an initialiser that makes a future, which may await, and [`wait`](OnceCell::wait) suspends the
-/// task, rather than block the thread, until another task sets the value.
+/// A cell starts empty. The first value that reaches it stays for as long as the cell lives, and
+/// every task gets a reference to that one value. It is like [`std::sync::OnceLock`], but for
+/// tasks. [`get_or_init`](OnceCell::get_or_init) and [`get_or_try_init`](OnceCell::get_or_try_init)
+/// take an initialiser that makes a future, which may await. [`wait`](OnceCell::wait) suspends the
+/// task until another task sets the value.
+///
+/// The cell needs no runtime and works under any executor. It is `Send` when `T` is `Send`, and
+/// `Sync` when `T` is `Send` and `Sync`. Its futures can move between threads when `T` is `Send`
+/// and `Sync` and the initialiser and the future it makes can move too.
 ///
 /// # Initialisation
 ///
-/// A task that finds the cell empty initialises it, and the tasks that find it empty meanwhile wait
-/// for that to end: one initialiser runs at a time, and the others take their turns in the order an
-/// async [`Mutex`] serves its waiters (see [fairness](crate::lock#fairness)). When the initialiser
-/// is done, the value is set and every task that waits for it is woken: those that
-/// [`wait`](OnceCell::wait) for it, and those that wait for their turn to initialise the cell or to
-/// [`set`](OnceCell::set) it. The latter find the value set, and so run no initialiser and set no
-/// value, each as soon as it is polled, without waiting for the tasks ahead of it in line.
+/// A task that finds the cell empty initialises it. Tasks that find it empty meanwhile wait for the
+/// initialiser to end. One initialiser runs at a time, and the others take their turns in the order
+/// an async [`Mutex`] serves its waiters (see [fairness](crate::lock#fairness)).
 ///
-/// An initialiser that fails, by returning an error from
-/// [`get_or_try_init`](OnceCell::get_or_try_init), or panics, or is given up by dropping the
-/// future that runs it, leaves the cell empty. The tasks waiting to
-/// initialise it do not see that as the answer: the next of them runs its own initialiser. A task
-/// that only [`wait`](OnceCell::wait)s for the value is not an initialiser, and goes on waiting.
+/// When the initialiser finishes, the value is set and every waiting task is woken. These are the
+/// tasks in [`wait`](OnceCell::wait), and the tasks waiting for their turn to initialise the cell
+/// or to [`set`](OnceCell::set) it. The latter find the value set, so they run no initialiser and
+/// set no value. Each completes as soon as it is polled, without waiting for the tasks ahead of it
+/// in line.
+///
+/// If an initialiser returns an error from [`get_or_try_init`](OnceCell::get_or_try_init), panics,
+/// or is given up by dropping the future that runs it, the cell stays empty. The next task in line
+/// runs its own initialiser. A task that only calls [`wait`](OnceCell::wait) is not an initialiser,
+/// and keeps waiting.
 ///
 /// # Re-entrancy
 ///
-/// The future an initialiser makes must not call [`get_or_init`](OnceCell::get_or_init),
-/// [`get_or_try_init`](OnceCell::get_or_try_init) or [`set`](OnceCell::set) on its own cell, nor
-/// [`wait`](OnceCell::wait) for its value: it would wait for the initialiser that is running it,
-/// which is itself, and the two would wait for each other for good, as the initialisation of a
-/// [`std::sync::OnceLock`] from inside its own initialiser does.
+/// The future that an initialiser makes must not call [`get_or_init`](OnceCell::get_or_init),
+/// [`get_or_try_init`](OnceCell::get_or_try_init) or [`set`](OnceCell::set) on its own cell, or
+/// [`wait`](OnceCell::wait) for its value. It would wait for itself and never complete, as when a
+/// [`std::sync::OnceLock`] is initialised from inside its own initialiser.
 ///
-/// # No poisoning, and `Send` and `Sync`
+/// # No poisoning
 ///
-/// A panic in an initialiser does not poison the cell: it leaves the cell empty, and the next
-/// initialiser runs, as the [module documentation](crate::lock#no-poisoning) says.
-///
-/// The cell is built on [`Event`] and needs no runtime: it works under any executor, and may be
-/// initialised and waited for from any thread. It is `Send` where `T` is `Send`, and `Sync` where
-/// `T` is `Send` and `Sync`. The futures of its methods may move between threads wherever the cell
-/// may be shared, which takes a `T` that is `Send` and `Sync`, and wherever the initialiser and the
-/// future it makes may move too.
+/// A panic in an initialiser does not poison the cell. The cell stays empty and the next
+/// initialiser runs. See the [module documentation](crate::lock#no-poisoning).
 ///
 /// # Example
 ///
-/// A value that is made when it is first asked for, with the work of making it awaited, and that
-/// every later task is handed without any more work:
+/// A value is created when it is first requested, by work that awaits. Later requests get the same
+/// value without repeating the work:
 ///
 /// ```
 /// use std::future;
@@ -76,11 +73,11 @@ use crate::Event;
 /// block_on(async {
 ///     let first = cell
 ///         .get_or_init(|| async {
-///             // Where the value is made, by awaiting whatever its making takes.
+///             // Create the value here, awaiting whatever that takes.
 ///             future::ready(String::from("made")).await
 ///         })
 ///         .await;
-///     // The cell holds a value already, so this initialiser has no say.
+///     // The cell already has a value, so this initialiser is not run.
 ///     let second = cell.get_or_init(|| async { String::from("again") }).await;
 ///
 ///     assert_eq!(first, "made");
@@ -103,7 +100,7 @@ pub struct OnceCell<T> {
 }
 
 impl<T> OnceCell<T> {
-    /// A new cell with no value.
+    /// Creates an empty cell.
     ///
     /// This is a `const fn`, so a cell can be a `static`.
     ///
@@ -128,7 +125,7 @@ impl<T> OnceCell<T> {
 
     /// The value, if the cell has one.
     ///
-    /// This never waits: it is `None` while no value has been set, including while an initialiser
+    /// This never waits. It returns `None` if no value has been set, including while an initialiser
     /// is running.
     ///
     /// # Example
@@ -147,10 +144,9 @@ impl<T> OnceCell<T> {
         self.value.get()
     }
 
-    /// The value, if the cell has one, borrowed mutably.
+    /// A mutable reference to the value, if the cell has one.
     ///
-    /// No initialiser can be running while the cell is borrowed mutably, so this reaches the value
-    /// without a wait.
+    /// No initialiser can be running while the cell is borrowed mutably, so this does not wait.
     ///
     /// # Example
     ///
@@ -168,8 +164,8 @@ impl<T> OnceCell<T> {
 
     /// Takes the value out of the cell, leaving it empty.
     ///
-    /// No initialiser can be running while the cell is borrowed mutably, so this takes the value
-    /// without a wait. The cell can be set again afterwards.
+    /// No initialiser can be running while the cell is borrowed mutably, so this does not wait. The
+    /// cell can be set again afterwards.
     ///
     /// # Example
     ///
@@ -185,9 +181,7 @@ impl<T> OnceCell<T> {
         self.value.take()
     }
 
-    /// Consumes the cell, handing back its value if it has one.
-    ///
-    /// The cell is moved, so no initialiser can be left running.
+    /// Consumes the cell and returns its value, if it has one.
     ///
     /// # Example
     ///
@@ -201,17 +195,19 @@ impl<T> OnceCell<T> {
         self.value.into_inner()
     }
 
-    /// Waits for the cell to have a value, and hands out a reference to it.
+    /// Waits for the cell to have a value and returns a reference to it.
     ///
-    /// This never initialises the cell: it waits for another task to do so, or to
+    /// This never initialises the cell. It waits for another task to initialise the cell or to
     /// [`set`](OnceCell::set) the value, however many initialisers fail or are given up on the way.
-    /// It completes at once where the cell has a value already.
+    /// If the cell already has a value, it completes at once.
     ///
-    /// Dropping the future before it completes gives up the wait, and affects no other task.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the wait. It affects no other task.
     ///
     /// # Example
     ///
-    /// A thread that waits for a value that this thread sets:
+    /// A thread waits for a value that this thread sets:
     ///
     /// ```
     /// use std::{sync::Arc, thread};
@@ -243,20 +239,19 @@ impl<T> OnceCell<T> {
         }
     }
 
-    /// The value, set by `init` where the cell has none, waiting for an initialiser that is running
-    /// already.
+    /// Returns the value, first setting it with `init` if the cell is empty.
     ///
-    /// Where the cell has a value, it is handed out at once and `init` is not called. Where it has
-    /// not, and no other initialiser is running, `init` is called and the future it makes is
-    /// awaited, and what that future resolves to becomes the value. Where another initialiser is
-    /// running, this call waits for it, and, if it sets the value, hands that out without calling
-    /// `init`; if it fails or is given up, this call initialises the cell itself, or waits for the
-    /// next initialiser in line to.
+    /// If the cell has a value, this returns it at once without calling `init`. Otherwise this call
+    /// waits for its turn to initialise the cell, behind any initialiser that is running. If the
+    /// cell has a value by then, this returns it without calling `init`. If not, this calls `init`
+    /// and awaits the future it makes, and the output of that future becomes the value.
     ///
-    /// Dropping the future before it completes gives up the call. Where it was running `init`'s
-    /// future, that is dropped with it and the cell stays empty. See the
-    /// [type documentation](OnceCell#initialisation) for what that means for the other tasks, and
-    /// for what not to do from inside `init`'s future.
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the call. If it was awaiting the future of
+    /// `init`, that future is dropped and the cell stays empty. See the
+    /// [type documentation](OnceCell#initialisation) for what this means for the other tasks, and
+    /// for what not to do inside the future of `init`.
     ///
     /// # Example
     ///
@@ -283,11 +278,21 @@ impl<T> OnceCell<T> {
         value
     }
 
-    /// The value, set by `init` where the cell has none, or the error `init`'s future failed with.
+    /// Returns the value, first setting it with `init` if the cell is empty.
     ///
-    /// As [`get_or_init`](OnceCell::get_or_init), except that the future `init` makes may fail.
-    /// Where it does, the error is returned, to this call alone, and the cell stays empty: the
-    /// next initialiser in line runs its own, rather than take the failure as the answer.
+    /// This works like [`get_or_init`](OnceCell::get_or_init), except that the future that `init`
+    /// makes can fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the future that `init` makes. The error goes to this call alone and the
+    /// cell stays empty. The next task in line runs its own initialiser instead of taking the
+    /// failure as the answer.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the call, as for
+    /// [`get_or_init`](OnceCell::get_or_init).
     ///
     /// # Example
     ///
@@ -331,13 +336,18 @@ impl<T> OnceCell<T> {
 
     /// Sets the value of the cell if it has none, waiting for an initialiser that is running.
     ///
-    /// Hands back a reference to the value that is set, or, where the cell has a value already,
-    /// `value` itself in the `Err`. An initialiser that is running has its turn first, which is
-    /// why this waits: if it sets a value, this call fails; if it fails or is given up, this call
-    /// sets its value, unless another initialiser that gets in first sets one, which makes this
-    /// call fail.
+    /// On success, returns a reference to the value that was set. A running initialiser gets its
+    /// turn first, which is why this waits. If that initialiser sets a value, this call fails. If
+    /// it fails or is given up, this call sets its value, unless another initialiser gets in first
+    /// and sets one, which makes this call fail.
     ///
-    /// Dropping the future before it completes gives up the call: `value` is dropped with it, and
+    /// # Errors
+    ///
+    /// Returns `value` in the `Err` if the cell already has a value.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes gives up the call. `value` is dropped with it, and
     /// the cell is left as it was.
     ///
     /// # Example
@@ -419,14 +429,14 @@ impl<T> OnceCell<T> {
 }
 
 impl<T> Default for OnceCell<T> {
-    /// A new cell with no value, whatever `T` is.
+    /// Creates an empty cell.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<T> From<T> for OnceCell<T> {
-    /// A new cell that holds `value` already.
+    /// Creates a cell that already holds `value`.
     fn from(value: T) -> Self {
         Self {
             value: OnceLock::from(value),
