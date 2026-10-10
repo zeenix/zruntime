@@ -1,33 +1,34 @@
-//! An async multi-producer multi-consumer channel, each of whose messages one receiver gets.
+//! An async multi-producer multi-consumer channel in which each message goes to one receiver.
 //!
-//! A channel is made by [`bounded`] or [`unbounded`], which hand out its first [`Sender`] and
-//! [`Receiver`]. Both sides can be cloned. A sender or a receiver can be sent to another thread,
-//! and shared with it, as long as the messages can be sent: `T` has to be
-//! [`Send`](std::marker::Send). A message is moved into the channel by a sender and out of it by a
-//! receiver, and never cloned, so it need not be [`Clone`]. Messages come out in the order they
-//! went in, and each of them goes to one receiver.
+//! [`bounded`] and [`unbounded`] create a channel and return its first [`Sender`] and
+//! [`Receiver`]. Both can be cloned. Both can be sent to other threads, and shared with them, if
+//! the message type `T` is [`Send`](std::marker::Send).
 //!
-//! A bounded channel holds at most as many messages as its capacity. A [`send`](Sender::send) into
-//! a full one waits until a receiver has made room, and a [`try_send`](Sender::try_send) fails. An
-//! unbounded channel holds any number of messages, and a send into it never waits.
+//! A sender moves each message into the channel, and a receiver moves it out. Messages are never
+//! cloned, so `T` need not be [`Clone`]. Messages are received in the order they were sent. Each
+//! message goes to exactly one receiver.
 //!
-//! A receiver receives through `&self`, so one receiver can be shared by reference among tasks that
-//! each wait for the next message. It is also a [`Stream`] of the messages it receives, which ends
-//! once the channel is closed and has none left.
+//! A bounded channel holds at most as many messages as its capacity. [`send`](Sender::send) waits
+//! while the channel is full, and [`try_send`](Sender::try_send) fails. An unbounded channel holds
+//! any number of messages, and sending to it never waits.
 //!
-//! A channel is closed by [`Sender::close`] or [`Receiver::close`], by its last sender being
-//! dropped, and by its last receiver being dropped. No message can be sent into a closed channel: a
-//! send fails and hands its message back. The messages in it can still be received, and only once
-//! none is left does a receive fail as well. When the last receiver is dropped, the messages left
-//! in the channel are dropped there and then, as nothing can receive them any more.
+//! A receiver receives through `&self`, so several tasks can share one receiver by reference and
+//! each wait for the next message. A receiver is also a [`Stream`] of messages. The stream ends
+//! when the channel is closed and empty.
 //!
-//! The channel is built on [`Event`] and needs no runtime. It works under any executor, and from
-//! any thread, inside a task or outside of one: a thread with no task to run can wait for a message
-//! with the `block_on` of any executor, as the example below does.
+//! A channel is closed by [`Sender::close`], by [`Receiver::close`], when its last sender is
+//! dropped, and when its last receiver is dropped. Sending to a closed channel fails and returns
+//! the message. Receiving still returns the messages left in the channel, and fails only when none
+//! is left. When the last receiver is dropped, the messages left in the channel are dropped at
+//! once, because nothing can receive them.
+//!
+//! The channel needs no runtime and works under any executor. It can be used from any thread,
+//! inside a task or not. A thread with no task can wait for a message with the `block_on` of any
+//! executor, as the example below does.
 //!
 //! # Example
 //!
-//! Two senders and two receivers, on a channel that holds two messages:
+//! Two senders and two receivers on a channel that holds two messages:
 //!
 //! ```
 //! use std::num::NonZeroUsize;
@@ -44,16 +45,16 @@
 //!     s1.send("hello").await.unwrap();
 //!     s2.send("world").await.unwrap();
 //!
-//!     // The channel is full, so a third message has to wait for room, or be tried again later.
+//!     // The channel is full, so `try_send` fails. A `send` would wait for room.
 //!     assert_eq!(s1.try_send("again"), Err(TrySendError::Full("again")));
 //!
-//!     // Each message goes to one receiver, the oldest first.
+//!     // Each message goes to one receiver, oldest first.
 //!     assert_eq!(r1.recv().await, Ok("hello"));
 //!     assert_eq!(r2.recv().await, Ok("world"));
 //!     assert!(r1.try_recv().unwrap_err().is_empty());
 //!
-//!     // The last sender being dropped closes the channel, which the receivers find out once
-//!     // there is no message left in it.
+//!     // Dropping the last sender closes the channel. The receivers see that once there is no
+//!     // message left in it.
 //!     drop(s1);
 //!     drop(s2);
 //!     assert_eq!(r1.recv().await, Err(RecvError));
@@ -63,11 +64,11 @@
 //!
 //! # Spreading work over threads
 //!
-//! A runtime of this crate is driven by one thread at a time, so all of its tasks share one core. A
-//! program whose work needs more runs several runtimes, one per thread, and spreads the work over
-//! them through a channel: each thread waits for the next piece of work on a clone of the same
-//! receiver, so that each piece goes to one thread, whichever takes it first, and a thread that is
-//! busy leaves it to the others. The results come back through a channel of their own.
+//! A runtime of this crate runs its tasks on one thread at a time, so all of its tasks share one
+//! core. To use more cores, run one runtime per thread and spread the work over them with a
+//! channel. Each thread waits for the next job on its own clone of the same receiver. Each job goes
+//! to whichever thread takes it first, so a busy thread leaves new jobs to the others. The results
+//! come back through a second channel.
 //!
 //! ```
 //! # #[cfg(feature = "runtime")]
@@ -85,10 +86,10 @@
 //!         let results = result_sender.clone();
 //!
 //!         thread::spawn(move || {
-//!             // A runtime of the thread's own, which no other thread drives.
+//!             // A runtime that belongs to this thread.
 //!             let runtime = LocalRuntime::new().unwrap();
 //!             runtime.block_on(async {
-//!                 // Ends once the channel is closed and no job is left in it.
+//!                 // The loop ends when the channel is closed and empty.
 //!                 while let Ok(n) = jobs.recv().await {
 //!                     let sum: u64 = (1..=n).sum();
 //!                     results.send(sum).await.unwrap();
@@ -97,8 +98,8 @@
 //!         })
 //!     })
 //!     .collect();
-//! // From here on, only the workers receive jobs and send results: the loop over the results
-//! // below ends once every sender of them is gone.
+//! // The workers are the only receivers of jobs and senders of results from here on. The loop
+//! // over the results below ends only when every result sender is dropped, including this one.
 //! drop(job_receiver);
 //! drop(result_sender);
 //!
@@ -107,11 +108,11 @@
 //!     for n in 1..=100 {
 //!         jobs.send(n).await.unwrap();
 //!     }
-//!     // No more jobs: once the workers have taken the last of them, their loops end.
+//!     // No more jobs. The workers' loops end after they take the last one.
 //!     drop(jobs);
 //!
-//!     // The results come in whichever order the workers finish their jobs in, and stop coming
-//!     // once every worker has dropped its sender.
+//!     // Results arrive in the order the workers finish their jobs. The loop ends when every
+//!     // worker has dropped its sender.
 //!     let mut total = 0;
 //!     while let Ok(sum) = results.recv().await {
 //!         total += sum;
@@ -126,45 +127,49 @@
 //! # }
 //! ```
 //!
-//! A worker whose jobs wait on I/O rather than keep the CPU busy can spawn a task for each job on
-//! its runtime instead of running them one after the other, so that its jobs wait together.
+//! If jobs mostly wait for I/O, a worker can spawn a task for each job on its runtime. The jobs
+//! then wait at the same time instead of one after the other.
 //!
 //! # Giving up a wait
 //!
-//! Dropping the future that [`Sender::send`] or [`Receiver::recv`] returned, before it completes,
-//! is fine: a timeout may do it, or a `select` that goes another way. A [`Recv`] that is dropped
-//! has taken no message, and a [`Send`] that is dropped has sent none: its message is dropped with
-//! it. A task that was woken for a message, or for room, and gives up passes that on to the next
-//! task waiting for it, so none is left stranded.
+//! It is safe to drop the future returned by [`Sender::send`] or [`Receiver::recv`] before it
+//! completes. A timeout or a `select` can do this. A dropped [`Recv`] has taken no message. A
+//! dropped [`Send`] has sent none, and its message is dropped with it. If a future was woken for a
+//! message or for room and is then dropped, the wake-up passes to the next task waiting, so no
+//! waiting task is left stranded.
 //!
 //! # Difference with `broadcast`
 //!
-//! The [`broadcast`] module of this crate, which has a feature of its own, has the same two sides.
-//! There, each message is delivered to every receiver, as a clone of it, so the messages have to be
-//! [`Clone`]; here, each message is delivered to one receiver only, and moved to it. Use that one
-//! where every receiver is to see everything, and this one where the receivers share the work.
+//! The [`broadcast`] module has the same two sides, a sender and a receiver. It delivers every
+//! message to every receiver, as a clone, so its messages must be [`Clone`]. This channel delivers
+//! each message to one receiver only, and moves it there. Use `broadcast` when every receiver
+//! must see every message, and this channel when receivers share the work.
+//!
+//! The `broadcast` module requires the `broadcast` feature.
 //!
 //! # Difference with `async-channel`
 //!
-//! This channel is modelled on [`async-channel`], and differs from it in these places:
+//! This channel is modelled on [`async-channel`]. It differs in these ways:
 //!
-//! * The capacity of [`bounded`] is a [`NonZeroUsize`]. A channel that holds no message is a type
-//!   error here, where `bounded(0)` of `async-channel` panics.
-//! * The last receiver being dropped drops the messages left in the channel. In `async-channel`, it
-//!   only closes the channel, and the messages stay in it until the channel itself is freed.
-//! * There is no blocking API. Where `async-channel` has `send_blocking` and `recv_blocking`, a
-//!   thread with no task to run waits with the `block_on` of an executor.
+//! * The capacity of [`bounded`] is a [`NonZeroUsize`], so the type rules out a zero capacity.
+//!   `async-channel` panics on `bounded(0)`.
+//! * Dropping the last receiver drops the messages left in the channel. `async-channel` only closes
+//!   the channel, and the messages stay in it until the channel itself is freed.
+//! * There is no blocking API. Instead of `send_blocking` and `recv_blocking`, a thread with no
+//!   task can wait with the `block_on` of an executor.
 //!
 //! # Performance
 //!
-//! This channel was timed against [`async-channel`] 2.5.0 and against the [`mpsc`] channel of
-//! tokio 1.53.1, which has one receiver and so takes no part where there are more. The messages are
-//! `u64`s, and the machine a shared x86-64 one of four cores. Each thread runs its whole part
-//! inside one `block_on` of `futures-lite`, and the tasks run on a tokio runtime of four workers.
-//! With threads or tasks, each sender sends 10,000 messages and a row times them all, except the
-//! one that says it times a message. The times are medians: those on one thread held to within 3%
-//! from run to run, the others moved by up to 30%. A send to tokio's unbounded channel is not a
-//! future, which spares it a poll.
+//! Benchmarks compared this channel with [`async-channel`] 2.5.0 and with the [`mpsc`] channel of
+//! tokio 1.53.1. Tokio's channel has only one receiver, so it is left out of the rows with several
+//! receivers. The messages are `u64`s. The machine is a shared x86-64 one with four cores. Each
+//! thread drives its whole part with one `block_on` call of `futures-lite`. Tasks run on a tokio
+//! runtime with four workers.
+//!
+//! In the rows with threads or tasks, each sender sends 10,000 messages, and the row times all of
+//! them. The row marked "a message" times one message. The times are medians. Times on one thread
+//! stayed within 3% from run to run. The others varied by up to 30%. Sending to tokio's unbounded
+//! channel is not a future, so it needs no poll.
 //!
 //! | What is timed                                             | `mpmc` | async-channel |  tokio |
 //! |-----------------------------------------------------------|-------:|--------------:|-------:|
@@ -181,14 +186,12 @@
 //! | 1 sender thread and 1 receiver thread, capacity 1024      | 2.3 ms |        1.7 ms | 2.8 ms |
 //! | 4 sender threads and 1 receiver thread, capacity 16       | 470 ms |        500 ms | 460 ms |
 //!
-//! In the last three rows, threads hand messages to each other through a channel that keeps
-//! filling or emptying, so a side has to wait every few messages. A wait parks the thread, and the
-//! time the OS takes to wake one, tens of microseconds on that machine, makes up nearly all of the
-//! time: there, the channels differ in how often a side ended up waiting, not in what an operation
-//! costs. Between tasks, whose wakes are cheap, the same exchange takes this channel half as long
-//! as the other two, as the row above them shows.
+//! In the last three rows, the channel keeps filling up or running empty, so a thread has to wait
+//! every few messages. Waiting parks the thread, and waking it takes the OS tens of microseconds
+//! on that machine. That wake-up makes up nearly all of the time. So in these rows the channels
+//! differ in how often a thread had to wait, not in the cost of an operation. Between tasks, which
+//! wake cheaply, this channel takes half as long as the other two, as the "a message" row shows.
 //!
-//! [`Event`]: crate::Event
 //! [`Stream`]: futures_core::Stream
 //! [`NonZeroUsize`]: std::num::NonZeroUsize
 //! [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
@@ -215,12 +218,13 @@ use futures_core::{
 
 use crate::{Event, EventListener};
 
-/// Creates a channel that holds at most `cap` messages, and hands out its first sender and
-/// receiver.
+/// Creates a channel that holds at most `cap` messages.
 ///
-/// A [`send`](Sender::send) into a full channel waits until a receiver has made room, and a
-/// [`try_send`](Sender::try_send) fails. The channel does not allocate room for `cap` messages up
-/// front, but as they come, so a very large capacity costs nothing until the messages are there.
+/// Returns the first sender and receiver. [`send`](Sender::send) waits while the channel is full,
+/// and [`try_send`](Sender::try_send) fails.
+///
+/// The channel allocates room as messages arrive, not `cap` messages up front. A very large
+/// capacity costs nothing until the messages are there.
 ///
 /// # Example
 ///
@@ -242,10 +246,9 @@ pub fn bounded<T>(cap: NonZeroUsize) -> (Sender<T>, Receiver<T>) {
     channel(Some(cap))
 }
 
-/// Creates a channel that holds any number of messages, and hands out its first sender and
-/// receiver.
+/// Creates a channel that holds any number of messages.
 ///
-/// A send into the channel never waits for room.
+/// Returns the first sender and receiver. Sending to the channel never waits for room.
 ///
 /// # Example
 ///
@@ -267,26 +270,32 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
 /// The sending side of a channel.
 ///
 /// Senders can be cloned and shared among threads. When the last sender is dropped, the channel is
-/// closed: no more messages can be sent, and the ones in it can still be received.
+/// closed. No more messages can be sent, but the messages in the channel can still be received.
 ///
-/// The channel can also be closed by calling [`Sender::close`].
+/// [`Sender::close`] also closes the channel.
 pub struct Sender<T> {
     channel: Arc<Channel<T>>,
 }
 
 impl<T> Sender<T> {
-    /// Sends a message into the channel.
+    /// Sends `msg` into the channel.
     ///
-    /// The returned future completes once the message is in the channel. If the channel is full,
-    /// it waits until a receiver has made room, and an unbounded channel is never full. If the
-    /// channel is closed, whether it was when this was called or is by the time there is room, the
-    /// future fails with a [`SendError`], which hands the message back.
+    /// The returned future completes when the message is in the channel. If the channel is full,
+    /// it waits for a receiver to make room. An unbounded channel is never full.
     ///
-    /// Dropping the future before it completes sends nothing, and drops the message.
+    /// # Errors
+    ///
+    /// Fails with a [`SendError`], which returns the message, if the channel is closed. This
+    /// includes a channel that is closed while the future waits for room.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes is safe. Nothing is sent, and the message is
+    /// dropped.
     ///
     /// # Example
     ///
-    /// A send into a full channel, which waits for the receive beside it to make room:
+    /// Sending to a full channel waits until a receive makes room:
     ///
     /// ```
     /// use std::num::NonZeroUsize;
@@ -314,10 +323,13 @@ impl<T> Sender<T> {
         }
     }
 
-    /// Tries to send a message into the channel, without waiting.
+    /// Tries to send `msg` into the channel without waiting.
     ///
-    /// Fails with [`TrySendError::Full`] if the channel is full, and with [`TrySendError::Closed`]
-    /// if it is closed, whether it has room or not. Either hands the message back.
+    /// # Errors
+    ///
+    /// Fails with [`TrySendError::Full`] if the channel is full. Fails with
+    /// [`TrySendError::Closed`] if the channel is closed, even if it has room. Both errors return
+    /// the message.
     ///
     /// # Example
     ///
@@ -340,10 +352,11 @@ impl<T> Sender<T> {
 
     /// Closes the channel.
     ///
-    /// Returns `true` if this call closed the channel, and `false` if it was closed already.
+    /// Returns `true` if this call closed the channel, and `false` if it was already closed.
     ///
-    /// No more messages can be sent into a closed channel: the sends waiting for room fail, and so
-    /// does every send after. The messages in it can still be received.
+    /// Closing makes every send fail, including sends that are waiting for room. The messages in
+    /// the channel can still be received. Once none is left, receives fail too, including receives
+    /// that are waiting for a message.
     ///
     /// # Example
     ///
@@ -366,9 +379,9 @@ impl<T> Sender<T> {
 
     /// Whether the channel is closed.
     ///
-    /// A channel is closed by [`Sender::close`] or [`Receiver::close`], by its last sender being
-    /// dropped, and by its last receiver being dropped. A closed channel can still hold messages
-    /// for its receivers.
+    /// A channel is closed by [`Sender::close`], by [`Receiver::close`], when its last sender is
+    /// dropped, and when its last receiver is dropped. Receivers can still receive the messages
+    /// that a closed channel holds.
     ///
     /// # Example
     ///
@@ -385,7 +398,7 @@ impl<T> Sender<T> {
         lock(&self.channel.state).closed
     }
 
-    /// Whether the channel holds no message.
+    /// Whether the channel holds no messages.
     ///
     /// # Example
     ///
@@ -402,7 +415,7 @@ impl<T> Sender<T> {
         lock(&self.channel.state).queue.is_empty()
     }
 
-    /// Whether the channel is full: it holds as many messages as its capacity.
+    /// Whether the channel holds as many messages as its capacity.
     ///
     /// An unbounded channel is never full.
     ///
@@ -428,8 +441,8 @@ impl<T> Sender<T> {
 
     /// The number of messages in the channel.
     ///
-    /// Other threads may send and receive in the meantime, so the number may be out of date by the
-    /// time this returns.
+    /// Other threads can send and receive at the same time, so the number can be out of date as
+    /// soon as this returns.
     ///
     /// # Example
     ///
@@ -450,7 +463,7 @@ impl<T> Sender<T> {
         lock(&self.channel.state).queue.len()
     }
 
-    /// The number of messages the channel holds at most, or `None` if it is unbounded.
+    /// The maximum number of messages the channel holds, or `None` if it is unbounded.
     ///
     /// # Example
     ///
@@ -511,7 +524,7 @@ impl<T> Sender<T> {
 }
 
 impl<T> Clone for Sender<T> {
-    /// Makes another sender of the same channel.
+    /// Creates another sender of the same channel.
     ///
     /// # Example
     ///
@@ -521,7 +534,7 @@ impl<T> Clone for Sender<T> {
     /// let (s1, r) = unbounded();
     /// let s2 = s1.clone();
     ///
-    /// // The channel stays open for as long as a sender is left.
+    /// // The channel stays open while at least one sender exists.
     /// drop(s1);
     /// s2.try_send(1).unwrap();
     /// assert_eq!(r.try_recv(), Ok(1));
@@ -562,15 +575,15 @@ impl<T> fmt::Debug for Sender<T> {
 
 /// The receiving side of a channel.
 ///
-/// Receivers can be cloned and shared among threads, or by reference, as [`Receiver::recv`] takes
-/// `&self`. Each message in the channel goes to one of them. When the last receiver is dropped, the
-/// channel is closed, and the messages left in it are dropped, as nothing can receive them any
-/// more.
+/// Receivers can be cloned and shared among threads. [`Receiver::recv`] takes `&self`, so a
+/// receiver can also be shared by reference. Each message goes to one receiver. When the last
+/// receiver is dropped, the channel is closed and the messages left in it are dropped, because
+/// nothing can receive them.
 ///
-/// The channel can also be closed by calling [`Receiver::close`].
+/// [`Receiver::close`] also closes the channel.
 ///
-/// A receiver is also a [`Stream`] of the messages it receives, which ends once the channel is
-/// closed and has none left, and a [`FusedStream`].
+/// A receiver is also a [`Stream`] of messages and a [`FusedStream`]. The stream ends when the
+/// channel is closed and empty.
 ///
 /// # Example
 ///
@@ -596,13 +609,19 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
-    /// Receives a message from the channel.
+    /// Receives the oldest message in the channel.
     ///
-    /// The returned future completes with the oldest message in the channel. If there is none, it
-    /// waits until one is sent. If the channel is closed, the messages left in it can still be
-    /// received, and the future fails with a [`RecvError`] once none is.
+    /// The returned future completes with the message. If the channel has none, it waits for one
+    /// to be sent.
     ///
-    /// Dropping the future before it completes takes no message from the channel.
+    /// # Errors
+    ///
+    /// Fails with a [`RecvError`] if the channel is closed and has no message left. A closed
+    /// channel still returns the messages it holds.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future before it completes is safe. It takes no message from the channel.
     ///
     /// # Example
     ///
@@ -627,11 +646,13 @@ impl<T> Receiver<T> {
         }
     }
 
-    /// Tries to receive a message from the channel, without waiting.
+    /// Tries to receive the oldest message in the channel without waiting.
     ///
-    /// Fails with [`TryRecvError::Empty`] if the channel holds no message and is not closed, and
-    /// with [`TryRecvError::Closed`] if it holds none and is closed. A closed channel still hands
-    /// out the messages left in it.
+    /// # Errors
+    ///
+    /// Fails with [`TryRecvError::Empty`] if the channel has no message and is not closed. Fails
+    /// with [`TryRecvError::Closed`] if it has no message and is closed. A closed channel still
+    /// returns the messages left in it.
     ///
     /// # Example
     ///
@@ -653,10 +674,11 @@ impl<T> Receiver<T> {
 
     /// Closes the channel.
     ///
-    /// Returns `true` if this call closed the channel, and `false` if it was closed already.
+    /// Returns `true` if this call closed the channel, and `false` if it was already closed.
     ///
-    /// No more messages can be sent into a closed channel: the sends waiting for room fail, and so
-    /// does every send after. The messages in it can still be received.
+    /// Closing makes every send fail, including sends that are waiting for room. The messages in
+    /// the channel can still be received. Once none is left, receives fail too, including receives
+    /// that are waiting for a message.
     ///
     /// # Example
     ///
@@ -696,7 +718,7 @@ impl<T> Receiver<T> {
         lock(&self.channel.state).closed
     }
 
-    /// Whether the channel holds no message.
+    /// Whether the channel holds no messages.
     ///
     /// # Example
     ///
@@ -713,7 +735,7 @@ impl<T> Receiver<T> {
         lock(&self.channel.state).queue.is_empty()
     }
 
-    /// Whether the channel is full: it holds as many messages as its capacity.
+    /// Whether the channel holds as many messages as its capacity.
     ///
     /// An unbounded channel is never full.
     ///
@@ -736,8 +758,8 @@ impl<T> Receiver<T> {
 
     /// The number of messages in the channel.
     ///
-    /// Other threads may send and receive in the meantime, so the number may be out of date by the
-    /// time this returns.
+    /// Other threads can send and receive at the same time, so the number can be out of date as
+    /// soon as this returns.
     ///
     /// # Example
     ///
@@ -756,7 +778,7 @@ impl<T> Receiver<T> {
         lock(&self.channel.state).queue.len()
     }
 
-    /// The number of messages the channel holds at most, or `None` if it is unbounded.
+    /// The maximum number of messages the channel holds, or `None` if it is unbounded.
     ///
     /// # Example
     ///
@@ -815,10 +837,10 @@ impl<T> Receiver<T> {
 }
 
 impl<T> Clone for Receiver<T> {
-    /// Makes another receiver of the same channel.
+    /// Creates another receiver of the same channel.
     ///
-    /// The messages in the channel are not copied: they are shared by all the receivers, and each
-    /// of them goes to one.
+    /// The receivers share the messages in the channel. A message is not copied: it goes to one
+    /// receiver.
     ///
     /// # Example
     ///
@@ -829,7 +851,7 @@ impl<T> Clone for Receiver<T> {
     /// let r2 = r1.clone();
     /// s.try_send(1).unwrap();
     ///
-    /// // The message goes to the receiver that asks for it first, and to no other.
+    /// // The message goes to whichever receiver asks first, and to no other.
     /// assert_eq!(r2.try_recv(), Ok(1));
     /// assert_eq!(r1.try_recv(), Err(TryRecvError::Empty));
     /// ```
@@ -933,14 +955,14 @@ impl<T> FusedStream for Receiver<T> {
     }
 }
 
-/// The future that [`Sender::send`] returns.
+/// The future returned by [`Sender::send`].
 ///
-/// It completes with `Ok(())` once the message is in the channel, and with a [`SendError`] that
-/// hands the message back if the channel is closed.
+/// It completes with `Ok(())` when the message is in the channel. If the channel is closed, it
+/// completes with a [`SendError`] that returns the message.
 ///
 /// # Panics
 ///
-/// Polling it again after it completed panics: the message is gone by then.
+/// Panics if it is polled again after it completed, because the message is gone by then.
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Send<'a, T> {
     sender: &'a Sender<T>,
@@ -1013,10 +1035,10 @@ impl<T> fmt::Debug for Send<'_, T> {
     }
 }
 
-/// The future that [`Receiver::recv`] returns.
+/// The future returned by [`Receiver::recv`].
 ///
-/// It completes with the message it received, or with a [`RecvError`] if the channel is closed and
-/// has none left.
+/// It completes with the message, or with a [`RecvError`] if the channel is closed and has no
+/// message left.
 #[must_use = "futures do nothing unless .awaited"]
 pub struct Recv<'a, T> {
     receiver: &'a Receiver<T>,
@@ -1077,7 +1099,7 @@ impl<T> fmt::Debug for Recv<'_, T> {
     }
 }
 
-/// The error of a [`Sender::send`] that failed: the channel is closed.
+/// The error returned by a [`Sender::send`] that failed because the channel is closed.
 ///
 /// It holds the message that was not sent.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1104,10 +1126,12 @@ impl<T> fmt::Display for SendError<T> {
     }
 }
 
-/// The error of a [`Sender::try_send`] that failed, which holds the message that was not sent.
+/// The error returned by a [`Sender::try_send`] that failed.
+///
+/// It holds the message that was not sent.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum TrySendError<T> {
-    /// The channel is full, and not closed.
+    /// The channel is full but not closed.
     Full(T),
     /// The channel is closed.
     Closed(T),
@@ -1121,7 +1145,7 @@ impl<T> TrySendError<T> {
         }
     }
 
-    /// Whether the channel is full, and not closed.
+    /// Whether the channel is full but not closed.
     pub fn is_full(&self) -> bool {
         matches!(self, TrySendError::Full(_))
     }
@@ -1152,7 +1176,9 @@ impl<T> fmt::Display for TrySendError<T> {
     }
 }
 
-/// The error of a [`Receiver::recv`] that failed: the channel is closed and has no message left.
+/// The error returned by a [`Receiver::recv`] that failed.
+///
+/// The channel is closed and has no message left.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub struct RecvError;
 
@@ -1164,17 +1190,17 @@ impl fmt::Display for RecvError {
     }
 }
 
-/// The error of a [`Receiver::try_recv`] that failed.
+/// The error returned by a [`Receiver::try_recv`] that failed.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum TryRecvError {
-    /// The channel holds no message, and is not closed.
+    /// The channel has no message but is not closed.
     Empty,
     /// The channel is closed and has no message left.
     Closed,
 }
 
 impl TryRecvError {
-    /// Whether the channel holds no message, and is not closed.
+    /// Whether the channel has no message but is not closed.
     pub fn is_empty(&self) -> bool {
         matches!(self, TryRecvError::Empty)
     }
